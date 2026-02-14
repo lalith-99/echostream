@@ -12,6 +12,11 @@ type Config struct {
 
 	DatabaseURL string
 	RedisURL    string
+
+	// JWTSecret is the HMAC key used to sign and verify JWT tokens.
+	// In production, load this from a secrets manager (AWS Secrets Manager, Vault).
+	// NEVER commit a real secret — the default here is only for local development.
+	JWTSecret string
 }
 
 func LoadConfig() (*Config, error) {
@@ -21,6 +26,7 @@ func LoadConfig() (*Config, error) {
 		RedisURL:    GetEnv("REDIS_URL", "redis://localhost:6379"),
 		Env:         GetEnv("ENV", "development"),
 		LogLevel:    GetEnv("LOG_LEVEL", "info"),
+		JWTSecret:   GetEnv("JWT_SECRET", "dev-secret-do-not-use-in-prod"),
 	}, nil
 }
 
