@@ -32,11 +32,12 @@ type Tenant struct {
 //   - JSON marshals to RFC3339 ("2026-02-08T10:30:00Z") which frontends
 //     universally understand.
 type User struct {
-	ID          uuid.UUID `json:"id"`
-	TenantID    uuid.UUID `json:"tenant_id"`
-	Email       string    `json:"email"`
-	DisplayName string    `json:"display_name"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID           uuid.UUID `json:"id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	Email        string    `json:"email"`
+	DisplayName  string    `json:"display_name"`
+	PasswordHash string    `json:"-"` // "-" = NEVER serialize to JSON. Passwords don't leave the server.
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // Channel is a chat room within a tenant (like #general or #incident-123).

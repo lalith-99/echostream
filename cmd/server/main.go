@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/gin-gonic/gin"
+	"github.com/lalith-99/echostream/internal/api"
 	"github.com/lalith-99/echostream/internal/config"
 	"github.com/lalith-99/echostream/internal/db"
 	"github.com/lalith-99/echostream/internal/middleware"
@@ -78,18 +79,26 @@ func run() error {
 	membershipRepo := postgres.NewMembershipStore(pool)
 	messageRepo := postgres.NewMessageStore(pool)
 	userRepo := postgres.NewUserStore(pool)
-
-	// Temporary: log that repos are ready (proves the wiring works).
-	// We'll remove this once handlers are connected.
-	logger.Info("repositories initialized",
-		zap.String("channel_repo", fmt.Sprintf("%T", channelRepo)),
-		zap.String("membership_repo", fmt.Sprintf("%T", membershipRepo)),
-		zap.String("message_repo", fmt.Sprintf("%T", messageRepo)),
-		zap.String("user_repo", fmt.Sprintf("%T", userRepo)),
-	)
+	tenantRepo := postgres.NewTenantStore(pool)
 
 	// ---------------------------------------------------------------
-	// 5. Set up HTTP server
+	// 5. Create handlers
+	//
+	// Each handler gets its dependencies injected via constructor.
+	// This is the same pattern we used for repositories: the handler
+	// holds interfaces, not concrete implementations.
+	//
+	// In tests, you'd pass mocks here. In production, you pass the
+	// postgres implementations. The handler doesn't know the difference.
+	// ---------------------------------------------------------------
+	channelHandler := api.NewChannelHandler(channelRepo, logger)
+	membershipHandler := api.NewMembershipHandler(membershipRepo, logger)
+	messageHandler := api.NewMessageHandler(messageRepo, logger)
+	userHandler := api.NewUserHandler(userRepo, logger)
+	authHandler := api.NewAuthHandler(userRepo, tenantRepo, cfg.JWTSecret, logger)
+
+	// ---------------------------------------------------------------
+	// 6. Set up HTTP server
 	// ---------------------------------------------------------------
 	srv := gin.New()
 	srv.Use(gin.Logger(), gin.Recovery())
@@ -100,13 +109,15 @@ func run() error {
 	)
 
 	// Health check is PUBLIC — no auth required.
-	// Load balancers (ALB, ECS) hit this to check if the server is alive.
-	// If it required auth, the LB couldn't health-check us.
 	srv.GET("/v1/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"status": "ok",
 		})
 	})
+
+	// Auth routes are PUBLIC — these PRODUCE tokens, so they can't require one.
+	srv.POST("/v1/auth/signup", authHandler.Signup)
+	srv.POST("/v1/auth/login", authHandler.Login)
 
 	// All other /v1/* routes require a valid JWT.
 	// The middleware runs BEFORE any handler in this group.
@@ -114,10 +125,32 @@ func run() error {
 	v1 := srv.Group("/v1")
 	v1.Use(middleware.AuthMiddleware(cfg.JWTSecret))
 
-	// Route registration will go here as we build handlers.
-	// Example: v1.POST("/channels", channelHandler.Create)
-	_ = channelRepo
-	_ = membershipRepo
+	// ---------------------------------------------------------------
+	// 7. Register routes
+	//
+	// RESTful routing conventions:
+	//   - POST /channels → create
+	//   - GET /channels → list all
+	//   - GET /channels/:id → get one
+	//   - POST /channels/:id/messages → create message in channel
+	//   - GET /channels/:id/messages → list messages in channel
+	//   - POST /channels/:id/join → join a channel
+	//   - POST /channels/:id/leave → leave a channel
+	//   - GET /channels/:id/members → list members of channel
+	//   - GET /users/me → get current user
+	// ---------------------------------------------------------------
+	v1.POST("/channels", channelHandler.Create)
+	v1.GET("/channels", channelHandler.List)
+	v1.GET("/channels/:id", channelHandler.GetByID)
+
+	v1.POST("/channels/:id/messages", messageHandler.Create)
+	v1.GET("/channels/:id/messages", messageHandler.List)
+
+	v1.POST("/channels/:id/join", membershipHandler.Join)
+	v1.POST("/channels/:id/leave", membershipHandler.Leave)
+	v1.GET("/channels/:id/members", membershipHandler.ListMembers)
+
+	v1.GET("/users/me", userHandler.GetMe)
 	_ = messageRepo
 	_ = userRepo
 

@@ -17,7 +17,7 @@ func NewMessageStore(pool *pgxpool.Pool) *MessageStore {
 	return &MessageStore{pool: pool}
 }
 
-func (s *MessageStore) Create(ctx context.Context, channelID uuid.UUID, senderID uuid.UUID, body string) (*models.Message, error) {
+func (s *MessageStore) Create(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID, senderID uuid.UUID, body string) (*models.Message, error) {
 	// Messages use bigserial (auto-increment), so we don't pass an ID.
 	// Postgres generates it. RETURNING gives it back.
 	query := `
@@ -39,7 +39,7 @@ func (s *MessageStore) Create(ctx context.Context, channelID uuid.UUID, senderID
 	return &msg, nil
 }
 
-func (s *MessageStore) ListByChannel(ctx context.Context, channelID uuid.UUID, before int64, limit int) ([]models.Message, error) {
+func (s *MessageStore) ListByChannel(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID, before int64, limit int) ([]models.Message, error) {
 	// Cursor-based pagination:
 	//
 	// before=0 → first page (newest messages). SQL: no WHERE on id.

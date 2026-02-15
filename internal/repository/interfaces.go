@@ -56,15 +56,29 @@ type MembershipRepository interface {
 // MessageRepository handles chat message persistence.
 type MessageRepository interface {
 	// Create persists a message and returns it with ID and CreatedAt populated.
-	Create(ctx context.Context, channelID uuid.UUID, senderID uuid.UUID, body string) (*models.Message, error)
+	Create(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID, senderID uuid.UUID, body string) (*models.Message, error)
 
 	// ListByChannel returns messages in a channel, newest first.
 	// Uses cursor-based pagination: before=0 means "from the top" (latest).
-	ListByChannel(ctx context.Context, channelID uuid.UUID, before int64, limit int) ([]models.Message, error)
+	ListByChannel(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID, before int64, limit int) ([]models.Message, error)
 }
 
 // UserRepository handles user data.
 type UserRepository interface {
+	// Create inserts a new user and returns it with ID and CreatedAt populated.
+	Create(ctx context.Context, tenantID uuid.UUID, email, displayName, passwordHash string) (*models.User, error)
+
 	// GetByID returns a user by their ID, scoped to the tenant.
 	GetByID(ctx context.Context, tenantID uuid.UUID, userID uuid.UUID) (*models.User, error)
+
+	// GetByEmail returns a user by email. Used for login.
+	// Returns nil, nil if not found.
+	GetByEmail(ctx context.Context, email string) (*models.User, error)
+}
+
+// TenantRepository handles tenant (workspace) data.
+type TenantRepository interface {
+	// Create inserts a new tenant and returns it with ID and CreatedAt populated.
+	// Called during signup — every new user gets a new workspace.
+	Create(ctx context.Context, name string) (*models.Tenant, error)
 }
