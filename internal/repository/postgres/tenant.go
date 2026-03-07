@@ -12,6 +12,7 @@ type TenantStore struct {
 	pool *pgxpool.Pool
 }
 
+// NewTenantStore initializes a new TenantStore.
 func NewTenantStore(pool *pgxpool.Pool) *TenantStore {
 	return &TenantStore{pool: pool}
 }

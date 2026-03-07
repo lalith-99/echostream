@@ -15,6 +15,7 @@ type UserHandler struct {
 	logger *zap.Logger
 }
 
+// NewUserHandler returns a handler for user endpoints.
 func NewUserHandler(repo repository.UserRepository, logger *zap.Logger) *UserHandler {
 	return &UserHandler{repo: repo, logger: logger}
 }

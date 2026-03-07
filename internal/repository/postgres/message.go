@@ -13,6 +13,7 @@ type MessageStore struct {
 	pool *pgxpool.Pool
 }
 
+// NewMessageStore returns a Postgres-backed message store.
 func NewMessageStore(pool *pgxpool.Pool) *MessageStore {
 	return &MessageStore{pool: pool}
 }

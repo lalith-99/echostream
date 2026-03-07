@@ -15,6 +15,7 @@ type ChannelStore struct {
 	pool *pgxpool.Pool
 }
 
+// NewChannelStore returns a ChannelStore backed by Postgres.
 func NewChannelStore(pool *pgxpool.Pool) *ChannelStore {
 	return &ChannelStore{pool: pool}
 }

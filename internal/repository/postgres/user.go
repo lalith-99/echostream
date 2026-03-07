@@ -15,6 +15,7 @@ type UserStore struct {
 	pool *pgxpool.Pool
 }
 
+// NewUserStore initializes a UserStore with a pgxpool.
 func NewUserStore(pool *pgxpool.Pool) *UserStore {
 	return &UserStore{pool: pool}
 }

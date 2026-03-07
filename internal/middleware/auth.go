@@ -95,6 +95,8 @@ func AuthMiddleware(secret string) gin.HandlerFunc {
 //     safe zero value that will fail any DB query gracefully.
 // ---------------------------------------------------------------
 
+// GetUserID retrieves the user ID from the context.
+// Returns uuid.Nil if the user ID is not present or is of the wrong type.
 func GetUserID(c *gin.Context) uuid.UUID {
 	val, exists := c.Get(ContextKeyUserID)
 	if !exists {
@@ -107,6 +109,8 @@ func GetUserID(c *gin.Context) uuid.UUID {
 	return id
 }
 
+// GetTenantID retrieves the tenant ID from the context.
+// Returns uuid.Nil if the tenant ID is not present or is of the wrong type.
 func GetTenantID(c *gin.Context) uuid.UUID {
 	val, exists := c.Get(ContextKeyTenantID)
 	if !exists {
@@ -119,6 +123,8 @@ func GetTenantID(c *gin.Context) uuid.UUID {
 	return id
 }
 
+// GetEmail retrieves the email from the context.
+// Returns an empty string if the email is not present or is of the wrong type.
 func GetEmail(c *gin.Context) string {
 	val, exists := c.Get(ContextKeyEmail)
 	if !exists {
