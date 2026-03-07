@@ -13,9 +13,6 @@ type Config struct {
 	DatabaseURL string
 	RedisURL    string
 
-	// JWTSecret is the HMAC key used to sign and verify JWT tokens.
-	// In production, load this from a secrets manager (AWS Secrets Manager, Vault).
-	// NEVER commit a real secret — the default here is only for local development.
 	JWTSecret string
 }
 

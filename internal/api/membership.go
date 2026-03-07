@@ -16,27 +16,16 @@ type MembershipHandler struct {
 	logger *zap.Logger
 }
 
+// NewMembershipHandler returns a MembershipHandler.
 func NewMembershipHandler(repo repository.MembershipRepository, logger *zap.Logger) *MembershipHandler {
 	return &MembershipHandler{repo: repo, logger: logger}
 }
 
-// joinChannelRequest is the JSON body for POST /v1/channels/:id/join
-//
-// Role defaults to "member" if not provided. Other roles: "admin", "moderator".
-// In a real system, only admins can set roles other than "member", but we'll
-// keep it simple for now.
 type joinChannelRequest struct {
 	Role string `json:"role"`
 }
 
 // Join handles POST /v1/channels/:id/join
-//
-// Why a separate "join" endpoint instead of POST /v1/channels/:id/members?
-//   - Semantics. "Join" is a user action on themselves. Adding a member is
-//     an admin action on someone else. We'd need two endpoints anyway:
-//       POST /channels/:id/members (admin adds someone)
-//       POST /channels/:id/join (user adds themselves)
-//     For this phase, we only implement self-join.
 func (h *MembershipHandler) Join(c *gin.Context) {
 	channelID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -46,10 +35,9 @@ func (h *MembershipHandler) Join(c *gin.Context) {
 
 	userID := middleware.GetUserID(c)
 
-	// Read the optional role from the body. Default to "member".
+	// Body is optional, default to "member" role.
 	var req joinChannelRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		// Body is optional — if it's missing or malformed, just use default.
 		req.Role = "member"
 	}
 	if req.Role == "" {
@@ -63,8 +51,6 @@ func (h *MembershipHandler) Join(c *gin.Context) {
 		return
 	}
 
-	// 204 No Content — success, no body to return.
-	// Standard for POST/PUT/DELETE that doesn't return data.
 	c.Status(http.StatusNoContent)
 }
 

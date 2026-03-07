@@ -18,12 +18,7 @@ func NewMembershipStore(pool *pgxpool.Pool) *MembershipStore {
 }
 
 func (s *MembershipStore) AddMember(ctx context.Context, channelID uuid.UUID, userID uuid.UUID, role string) error {
-	// ON CONFLICT DO NOTHING: if the user is already a member, this is a
-	// no-op instead of an error. Why?
-	//   - The API call "join channel" should be idempotent. Calling it twice
-	//     shouldn't fail — it should just succeed silently the second time.
-	//   - Without this, a duplicate (channel_id, user_id) would violate the
-	//     primary key constraint and return a Postgres error.
+	// ON CONFLICT DO NOTHING makes this idempotent.
 	query := `
 		INSERT INTO channel_members (channel_id, user_id, role)
 		VALUES ($1, $2, $3)
@@ -37,8 +32,6 @@ func (s *MembershipStore) AddMember(ctx context.Context, channelID uuid.UUID, us
 }
 
 func (s *MembershipStore) RemoveMember(ctx context.Context, channelID uuid.UUID, userID uuid.UUID) error {
-	// DELETE is naturally idempotent: if the row doesn't exist, it deletes
-	// zero rows — no error. So "leave channel" called twice is fine.
 	query := `
 		DELETE FROM channel_members
 		WHERE channel_id = $1 AND user_id = $2`
@@ -78,13 +71,6 @@ func (s *MembershipStore) ListMembers(ctx context.Context, channelID uuid.UUID) 
 }
 
 func (s *MembershipStore) IsMember(ctx context.Context, channelID uuid.UUID, userID uuid.UUID) (bool, error) {
-	// SELECT EXISTS wraps a subquery and returns a single boolean.
-	// Postgres stops scanning as soon as it finds one matching row.
-	//
-	// Why not "SELECT COUNT(*) ... WHERE ... " and check count > 0?
-	//   - COUNT scans ALL matching rows to count them. Wasteful.
-	//   - EXISTS stops at the first match. O(1) vs O(n).
-	//   - For a hot-path check (every message send), this matters.
 	query := `
 		SELECT EXISTS (
 			SELECT 1 FROM channel_members

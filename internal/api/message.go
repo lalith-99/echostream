@@ -11,11 +11,13 @@ import (
 	"go.uber.org/zap"
 )
 
+// MessageHandler handles message operations.
 type MessageHandler struct {
 	repo   repository.MessageRepository
 	logger *zap.Logger
 }
 
+// NewMessageHandler returns a MessageHandler.
 func NewMessageHandler(repo repository.MessageRepository, logger *zap.Logger) *MessageHandler {
 	return &MessageHandler{repo: repo, logger: logger}
 }
@@ -48,10 +50,6 @@ func (h *MessageHandler) Create(c *gin.Context) {
 }
 
 // List handles GET /v1/channels/:id/messages?before=123&limit=50
-//
-// Cursor-based pagination:
-//   - "before" = message ID. "Give me messages older than this." 0 = start from latest.
-//   - "limit"  = how many to return. Default 50, capped at 100.
 func (h *MessageHandler) List(c *gin.Context) {
 	channelID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -59,7 +57,6 @@ func (h *MessageHandler) List(c *gin.Context) {
 		return
 	}
 
-	// Read query param "before" — defaults to 0 if not provided.
 	var before int64
 	if b := c.Query("before"); b != "" {
 		before, err = strconv.ParseInt(b, 10, 64)
@@ -69,7 +66,6 @@ func (h *MessageHandler) List(c *gin.Context) {
 		}
 	}
 
-	// Read query param "limit" — defaults to 50, capped at 100.
 	limit := 50
 	if l := c.Query("limit"); l != "" {
 		limit, err = strconv.Atoi(l)
@@ -81,8 +77,11 @@ func (h *MessageHandler) List(c *gin.Context) {
 			limit = 100
 		}
 	}
+	if before < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid 'before' parameter"})
+		return
+	}
 
-	// Interface: ListByChannel(ctx, tenantID, channelID, before, limit)
 	tenantID := middleware.GetTenantID(c)
 	messages, err := h.repo.ListByChannel(c.Request.Context(), tenantID, channelID, before, limit)
 	if err != nil {

@@ -66,8 +66,7 @@ func (s *UserStore) GetByID(ctx context.Context, tenantID uuid.UUID, userID uuid
 	return &u, nil
 }
 
-// GetByEmail looks up a user by email (globally, not tenant-scoped).
-// Used for login — you type your email, we find you.
+// GetByEmail looks up a user by email (not tenant-scoped, used for login).
 func (s *UserStore) GetByEmail(ctx context.Context, email string) (*models.User, error) {
 	query := `
 		SELECT id, tenant_id, email, display_name, password_hash, created_at

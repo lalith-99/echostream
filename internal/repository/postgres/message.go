@@ -19,8 +19,6 @@ func NewMessageStore(pool *pgxpool.Pool) *MessageStore {
 }
 
 func (s *MessageStore) Create(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID, senderID uuid.UUID, body string) (*models.Message, error) {
-	// Messages use bigserial (auto-increment), so we don't pass an ID.
-	// Postgres generates it. RETURNING gives it back.
 	query := `
 		INSERT INTO messages (channel_id, sender_id, body, created_at)
 		VALUES ($1, $2, $3, now())
@@ -41,14 +39,7 @@ func (s *MessageStore) Create(ctx context.Context, tenantID uuid.UUID, channelID
 }
 
 func (s *MessageStore) ListByChannel(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID, before int64, limit int) ([]models.Message, error) {
-	// Cursor-based pagination:
-	//
-	// before=0 → first page (newest messages). SQL: no WHERE on id.
-	// before=42 → "give me messages older than ID 42". SQL: WHERE id < 42.
-	//
-	// We build the query conditionally based on whether `before` is set.
-	// Both paths ORDER BY id DESC and LIMIT to cap the result set.
-
+	// Cursor-based pagination: before=0 means latest, before=N means older than ID N.
 	var query string
 	var args []any
 
@@ -69,13 +60,6 @@ func (s *MessageStore) ListByChannel(ctx context.Context, tenantID uuid.UUID, ch
 			LIMIT $2`
 		args = []any{channelID, limit}
 	}
-
-	// Why ORDER BY id DESC instead of created_at DESC?
-	//   - id (bigserial) is monotonically increasing — same order as time,
-	//     but faster to sort on (integer vs timestamp comparison).
-	//   - We already have idx_messages_channel_created, but a query on
-	//     (channel_id, id DESC) would be even faster. We can add that index
-	//     later if needed. For now, the id ordering is correct and efficient.
 
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
