@@ -13,6 +13,7 @@ type MembershipStore struct {
 	pool *pgxpool.Pool
 }
 
+// NewMembershipStore creates a membership store backed by Postgres.
 func NewMembershipStore(pool *pgxpool.Pool) *MembershipStore {
 	return &MembershipStore{pool: pool}
 }
@@ -47,7 +48,8 @@ func (s *MembershipStore) ListMembers(ctx context.Context, channelID uuid.UUID) 
 	query := `
 		SELECT channel_id, user_id, role
 		FROM channel_members
-		WHERE channel_id = $1`
+		WHERE channel_id = $1
+		ORDER BY user_id`
 
 	rows, err := s.pool.Query(ctx, query, channelID)
 	if err != nil {

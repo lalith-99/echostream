@@ -16,6 +16,7 @@ type Config struct {
 	JWTSecret string
 }
 
+// LoadConfig reads config from environment variables.
 func LoadConfig() (*Config, error) {
 	return &Config{
 		Port:        GetEnv("PORT", "8081"),
@@ -27,8 +28,9 @@ func LoadConfig() (*Config, error) {
 	}, nil
 }
 
+// GetEnv returns an env var or a default value.
 func GetEnv(key, defaultValue string) string {
-	if value, exists := os.LookupEnv(key); exists {
+	if value := os.Getenv(key); value != "" {
 		return value
 	}
 	return defaultValue
