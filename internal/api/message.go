@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -8,18 +10,25 @@ import (
 	"github.com/google/uuid"
 	"github.com/lalith-99/echostream/internal/middleware"
 	"github.com/lalith-99/echostream/internal/repository"
+	"github.com/lalith-99/echostream/internal/websocket"
 	"go.uber.org/zap"
 )
 
+// EventPublisher publishes events to a pub/sub channel (e.g., Redis).
+type EventPublisher interface {
+	Publish(ctx context.Context, channel string, payload []byte) error
+}
+
 // MessageHandler handles message operations.
 type MessageHandler struct {
-	repo   repository.MessageRepository
-	logger *zap.Logger
+	repo      repository.MessageRepository
+	publisher EventPublisher
+	logger    *zap.Logger
 }
 
 // NewMessageHandler returns a MessageHandler.
-func NewMessageHandler(repo repository.MessageRepository, logger *zap.Logger) *MessageHandler {
-	return &MessageHandler{repo: repo, logger: logger}
+func NewMessageHandler(repo repository.MessageRepository, publisher EventPublisher, logger *zap.Logger) *MessageHandler {
+	return &MessageHandler{repo: repo, publisher: publisher, logger: logger}
 }
 
 type createMessageRequest struct {
@@ -46,6 +55,20 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create message"})
 		return
 	}
+
+	// Fan out via Redis so all connected WS clients see it.
+	if h.publisher != nil {
+		event := websocket.OutboundEvent{
+			Type:      "message",
+			ChannelID: channelID.String(),
+			Message:   ch,
+		}
+		data, _ := json.Marshal(event)
+		if err := h.publisher.Publish(c.Request.Context(), "ch:"+channelID.String(), data); err != nil {
+			h.logger.Error("failed to publish message event", zap.Error(err))
+		}
+	}
+
 	c.JSON(http.StatusCreated, ch)
 }
 

@@ -11,7 +11,9 @@ import (
 	"github.com/lalith-99/echostream/internal/db"
 	"github.com/lalith-99/echostream/internal/middleware"
 	"github.com/lalith-99/echostream/internal/observ"
+	redisclient "github.com/lalith-99/echostream/internal/redis"
 	"github.com/lalith-99/echostream/internal/repository/postgres"
+	"github.com/lalith-99/echostream/internal/websocket"
 	"go.uber.org/zap"
 )
 
@@ -40,6 +42,24 @@ func run() error {
 	}
 	defer database.Close()
 
+	// Redis
+	rc, err := redisclient.NewClient(cfg.RedisURL, logger)
+	if err != nil {
+		return fmt.Errorf("connect to redis: %w", err)
+	}
+	defer rc.Close()
+
+	// WebSocket hub + Redis pub/sub bridge
+	hub := websocket.NewHub(logger)
+	pubsub := redisclient.NewPubSub(rc, hub, logger)
+	hub.SetChannelCallbacks(pubsub.Subscribe, pubsub.Unsubscribe)
+
+	go hub.Run()
+	pubsubCtx, pubsubCancel := context.WithCancel(context.Background())
+	defer pubsubCancel()
+	go pubsub.Listen(pubsubCtx)
+	defer pubsub.Close()
+
 	// Repos
 	pool := database.Pool()
 	channelRepo := postgres.NewChannelStore(pool)
@@ -51,9 +71,10 @@ func run() error {
 	// Handlers
 	channelHandler := api.NewChannelHandler(channelRepo, logger)
 	membershipHandler := api.NewMembershipHandler(membershipRepo, logger)
-	messageHandler := api.NewMessageHandler(messageRepo, logger)
+	messageHandler := api.NewMessageHandler(messageRepo, rc, logger)
 	userHandler := api.NewUserHandler(userRepo, logger)
 	authHandler := api.NewAuthHandler(userRepo, tenantRepo, cfg.JWTSecret, logger)
+	wsHandler := api.NewWSHandler(hub, cfg.JWTSecret, logger)
 
 	srv := gin.New()
 	srv.Use(gin.Logger(), gin.Recovery())
@@ -69,6 +90,7 @@ func run() error {
 	})
 	srv.POST("/v1/auth/signup", authHandler.Signup)
 	srv.POST("/v1/auth/login", authHandler.Login)
+	srv.GET("/v1/ws", wsHandler.HandleWS)
 
 	// Authenticated routes
 	v1 := srv.Group("/v1")
@@ -86,8 +108,6 @@ func run() error {
 	v1.GET("/channels/:id/members", membershipHandler.ListMembers)
 
 	v1.GET("/users/me", userHandler.GetMe)
-	_ = messageRepo
-	_ = userRepo
 
 	srv.Run(":" + cfg.Port)
 
