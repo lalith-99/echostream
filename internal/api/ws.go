@@ -13,12 +13,23 @@ import (
 const (
 	wsBufferSize = 1024
 	wsTokenQuery = "token"
+
+	wsErrMissingToken = "missing token query parameter"
+	wsErrInvalidToken = "invalid or expired token"
 )
 
 var upgrader = gorillaws.Upgrader{
 	ReadBufferSize:  wsBufferSize,
 	WriteBufferSize: wsBufferSize,
 	CheckOrigin: func(r *http.Request) bool {
+		// Allow localhost and same-origin requests
+		// In production, configure allowed origins via environment variable
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // Allow requests without Origin header (e.g., native apps)
+		}
+		// For development, allow all origins. In production, check against allowlist.
+		// TODO: Add ALLOWED_ORIGINS env var and validate against it
 		return true
 	},
 }
@@ -39,13 +50,13 @@ func NewWSHandler(hub *websocket.Hub, jwtSecret string, logger *zap.Logger) *WSH
 func (h *WSHandler) HandleWS(c *gin.Context) {
 	tokenString := c.Query(wsTokenQuery)
 	if tokenString == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token query parameter"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": wsErrMissingToken})
 		return
 	}
 
 	claims, err := auth.ParseToken(tokenString, h.jwtSecret)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
+		c.JSON(http.StatusUnauthorized, gin.H{"error": wsErrInvalidToken})
 		return
 	}
 
