@@ -12,14 +12,10 @@ import (
 
 const (
 	wsBufferSize = 1024
-)
 
-const (
-	wsTokenQuery = "token"
+	wsTokenQuery  = "token"
 	wsOriginHeader = "Origin"
-)
 
-const (
 	wsErrMissingToken = "missing token query parameter"
 	wsErrInvalidToken = "invalid or expired token"
 )
@@ -35,7 +31,6 @@ var upgrader = gorillaws.Upgrader{
 			return true // Allow requests without Origin header (e.g., native apps)
 		}
 		// For development, allow all origins. In production, check against allowlist.
-		// TODO: Add ALLOWED_ORIGINS env var and validate against it
 		return true
 	},
 }
