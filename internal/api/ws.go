@@ -12,8 +12,14 @@ import (
 
 const (
 	wsBufferSize = 1024
-	wsTokenQuery = "token"
+)
 
+const (
+	wsTokenQuery = "token"
+	wsOriginHeader = "Origin"
+)
+
+const (
 	wsErrMissingToken = "missing token query parameter"
 	wsErrInvalidToken = "invalid or expired token"
 )
@@ -24,7 +30,7 @@ var upgrader = gorillaws.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		// Allow localhost and same-origin requests
 		// In production, configure allowed origins via environment variable
-		origin := r.Header.Get("Origin")
+		origin := r.Header.Get(wsOriginHeader)
 		if origin == "" {
 			return true // Allow requests without Origin header (e.g., native apps)
 		}
