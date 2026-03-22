@@ -1,9 +1,11 @@
 package websocket
 
 import (
+	"context"
 	"encoding/json"
 
 	"github.com/google/uuid"
+	"github.com/lalith-99/echostream/internal/presence"
 	"go.uber.org/zap"
 )
 
@@ -36,11 +38,16 @@ type Hub struct {
 	unsubscribeCh chan *subscription
 	broadcastCh   chan *broadcastMessage
 	typingCh      chan *typingEvent
+	shutdown      chan struct{}
 
 	// Called when a channel gets its first local subscriber.
 	onChannelActive func(channelID uuid.UUID)
 	// Called when a channel loses its last local subscriber.
 	onChannelInactive func(channelID uuid.UUID)
+
+	presence  *presence.Tracker              // nil until SetPresenceTracker is called
+	userConns map[uuid.UUID]int              // open WS conns per userID
+	cancelKA  map[*Client]context.CancelFunc // per-client keepalive cancel
 
 	logger *zap.Logger
 }
@@ -56,6 +63,9 @@ func NewHub(logger *zap.Logger) *Hub {
 		unsubscribeCh:  make(chan *subscription),
 		broadcastCh:    make(chan *broadcastMessage, 256),
 		typingCh:       make(chan *typingEvent, 256),
+		shutdown:       make(chan struct{}),
+		userConns:      make(map[uuid.UUID]int),
+		cancelKA:       make(map[*Client]context.CancelFunc),
 		logger:         logger,
 	}
 }
@@ -64,6 +74,11 @@ func NewHub(logger *zap.Logger) *Hub {
 func (h *Hub) SetChannelCallbacks(onActive, onInactive func(uuid.UUID)) {
 	h.onChannelActive = onActive
 	h.onChannelInactive = onInactive
+}
+
+// SetPresenceTracker enables online/offline tracking via Redis.
+func (h *Hub) SetPresenceTracker(t *presence.Tracker) {
+	h.presence = t
 }
 
 // Register queues a new client for the hub to track.
@@ -77,12 +92,30 @@ func (h *Hub) Broadcast(channelID uuid.UUID, data []byte) {
 	h.broadcastCh <- &broadcastMessage{channelID: channelID, data: data}
 }
 
+// Shutdown signals the hub to stop processing events.
+func (h *Hub) Shutdown() {
+	close(h.shutdown)
+}
+
 // Run is the hub's main event loop. Must be started as a goroutine.
 func (h *Hub) Run() {
 	for {
 		select {
+		case <-h.shutdown:
+			h.logger.Info("hub shutting down")
+			return
 		case client := <-h.register:
 			h.clientChannels[client] = make(map[uuid.UUID]struct{})
+			h.userConns[client.userID]++
+
+			// Start presence tracking for this connection
+			if h.presence != nil {
+				ctx, cancel := context.WithCancel(context.Background())
+				h.cancelKA[client] = cancel
+				h.presence.SetOnline(ctx, client.userID)
+				go h.presence.KeepAlive(ctx, client.userID)
+			}
+
 			h.logger.Debug("client connected",
 				zap.String("user_id", client.userID.String()),
 			)
@@ -95,13 +128,32 @@ func (h *Hub) Run() {
 				delete(h.clientChannels, client)
 				close(client.send)
 			}
+
+			// Stop this client's keepalive goroutine
+			if cancel, ok := h.cancelKA[client]; ok {
+				cancel()
+				delete(h.cancelKA, client)
+			}
+
+			// Only set offline when last connection for this user closes
+			h.userConns[client.userID]--
+			if h.userConns[client.userID] <= 0 {
+				delete(h.userConns, client.userID)
+				if h.presence != nil {
+					h.presence.SetOffline(context.Background(), client.userID)
+				}
+			}
+
 			h.logger.Debug("client disconnected",
 				zap.String("user_id", client.userID.String()),
 			)
 
 		case sub := <-h.subscribeCh:
 			h.addToChannel(sub.client, sub.channelID)
-			if data, err := json.Marshal(OutboundEvent{Type: "subscribed", ChannelID: sub.channelID.String()}); err == nil {
+			data, err := json.Marshal(OutboundEvent{Type: "subscribed", ChannelID: sub.channelID.String()})
+			if err != nil {
+				h.logger.Error("failed to marshal subscribed event", zap.Error(err))
+			} else {
 				sub.client.Send(data)
 			}
 			h.logger.Debug("client subscribed to channel",
@@ -111,7 +163,10 @@ func (h *Hub) Run() {
 
 		case sub := <-h.unsubscribeCh:
 			h.removeFromChannel(sub.client, sub.channelID)
-			if data, err := json.Marshal(OutboundEvent{Type: "unsubscribed", ChannelID: sub.channelID.String()}); err == nil {
+			data, err := json.Marshal(OutboundEvent{Type: "unsubscribed", ChannelID: sub.channelID.String()})
+			if err != nil {
+				h.logger.Error("failed to marshal unsubscribed event", zap.Error(err))
+			} else {
 				sub.client.Send(data)
 			}
 
@@ -129,7 +184,11 @@ func (h *Hub) Run() {
 					ChannelID: ev.channelID.String(),
 					UserID:    ev.userID.String(),
 				}
-				data, _ := json.Marshal(event)
+				data, err := json.Marshal(event)
+				if err != nil {
+					h.logger.Error("failed to marshal typing event", zap.Error(err))
+					continue
+				}
 				for client := range clients {
 					if client.userID != ev.userID {
 						client.Send(data)

@@ -139,7 +139,10 @@ func (c *Client) handleMessage(msg InboundMessage) {
 }
 
 func (c *Client) sendError(msg string) {
-	if data, err := json.Marshal(OutboundEvent{Type: "error", Error: msg}); err == nil {
-		c.Send(data)
+	data, err := json.Marshal(OutboundEvent{Type: "error", Error: msg})
+	if err != nil {
+		c.logger.Error("failed to marshal error event", zap.Error(err))
+		return
 	}
+	c.Send(data)
 }

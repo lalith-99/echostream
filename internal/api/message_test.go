@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/lalith-99/echostream/internal/middleware"
 	"github.com/lalith-99/echostream/internal/models"
+	"github.com/lalith-99/echostream/internal/service"
 	"go.uber.org/zap"
 )
 
@@ -21,6 +22,7 @@ func init() { gin.SetMode(gin.TestMode) }
 
 // --- mocks ---
 
+// mockMessageRepo implements repository.MessageRepository.
 type mockMessageRepo struct {
 	createFn func(ctx context.Context, tenantID, channelID, senderID uuid.UUID, body string) (*models.Message, error)
 	listFn   func(ctx context.Context, tenantID, channelID uuid.UUID, before int64, limit int) ([]models.Message, error)
@@ -46,6 +48,22 @@ func (m *mockMessageRepo) ListByChannel(ctx context.Context, tenantID, channelID
 	return []models.Message{}, nil
 }
 
+// mockMembershipRepo implements repository.MembershipRepository.
+type mockMembershipRepo struct {
+	isMember bool
+	err      error
+}
+
+func (m *mockMembershipRepo) IsMember(_ context.Context, _, _ uuid.UUID) (bool, error) {
+	return m.isMember, m.err
+}
+func (m *mockMembershipRepo) AddMember(_ context.Context, _, _ uuid.UUID, _ string) error { return nil }
+func (m *mockMembershipRepo) RemoveMember(_ context.Context, _, _ uuid.UUID) error        { return nil }
+func (m *mockMembershipRepo) ListMembers(_ context.Context, _ uuid.UUID) ([]models.ChannelMember, error) {
+	return nil, nil
+}
+
+// mockPublisher implements service.EventPublisher.
 type mockPublisher struct {
 	published []struct {
 		channel string
@@ -62,7 +80,25 @@ func (m *mockPublisher) Publish(_ context.Context, channel string, payload []byt
 	return m.err
 }
 
-// setupRouter creates a gin router with fake auth context injected.
+// --- helpers ---
+
+// newTestHandler builds a MessageHandler with configurable mocks.
+// isMember=true means the sender passes the membership check.
+func newTestHandler(msgRepo *mockMessageRepo, memRepo *mockMembershipRepo, pub *mockPublisher) *MessageHandler {
+	if msgRepo == nil {
+		msgRepo = &mockMessageRepo{}
+	}
+	if memRepo == nil {
+		memRepo = &mockMembershipRepo{isMember: true}
+	}
+	var publisher service.EventPublisher
+	if pub != nil {
+		publisher = pub
+	}
+	svc := service.NewMessageService(msgRepo, memRepo, publisher, zap.NewNop())
+	return NewMessageHandler(svc, zap.NewNop())
+}
+
 func setupRouter(h *MessageHandler, uid, tid uuid.UUID) *gin.Engine {
 	r := gin.New()
 	r.Use(func(c *gin.Context) {
@@ -81,12 +117,12 @@ func setupRouter(h *MessageHandler, uid, tid uuid.UUID) *gin.Engine {
 func TestCreate_Success(t *testing.T) {
 	uid, tid, chID := uuid.New(), uuid.New(), uuid.New()
 	pub := &mockPublisher{}
-	h := NewMessageHandler(&mockMessageRepo{}, pub, zap.NewNop())
+	h := newTestHandler(nil, nil, pub)
 	r := setupRouter(h, uid, tid)
 
-	body := `{"content":"hello"}`
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("POST", "/v1/channels/"+chID.String()+"/messages", strings.NewReader(body))
+	req, _ := http.NewRequest("POST", "/v1/channels/"+chID.String()+"/messages",
+		strings.NewReader(`{"content":"hello"}`))
 	req.Header.Set("Content-Type", "application/json")
 	r.ServeHTTP(w, req)
 
@@ -94,7 +130,7 @@ func TestCreate_Success(t *testing.T) {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// Publisher should have been called once with correct channel key
+	// Publisher should have been called with the correct channel key
 	if len(pub.published) != 1 {
 		t.Fatalf("expected 1 publish, got %d", len(pub.published))
 	}
@@ -104,7 +140,7 @@ func TestCreate_Success(t *testing.T) {
 }
 
 func TestCreate_MissingContent(t *testing.T) {
-	h := NewMessageHandler(&mockMessageRepo{}, nil, zap.NewNop())
+	h := newTestHandler(nil, nil, nil)
 	r := setupRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -114,12 +150,12 @@ func TestCreate_MissingContent(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", w.Code)
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
 func TestCreate_InvalidChannelID(t *testing.T) {
-	h := NewMessageHandler(&mockMessageRepo{}, nil, zap.NewNop())
+	h := newTestHandler(nil, nil, nil)
 	r := setupRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -133,13 +169,28 @@ func TestCreate_InvalidChannelID(t *testing.T) {
 	}
 }
 
+func TestCreate_NotMember(t *testing.T) {
+	h := newTestHandler(nil, &mockMembershipRepo{isMember: false}, nil)
+	r := setupRouter(h, uuid.New(), uuid.New())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/channels/"+uuid.New().String()+"/messages",
+		strings.NewReader(`{"content":"hi"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestCreate_RepoError(t *testing.T) {
 	repo := &mockMessageRepo{
 		createFn: func(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, string) (*models.Message, error) {
 			return nil, errors.New("db down")
 		},
 	}
-	h := NewMessageHandler(repo, nil, zap.NewNop())
+	h := newTestHandler(repo, nil, nil)
 	r := setupRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -154,7 +205,7 @@ func TestCreate_RepoError(t *testing.T) {
 }
 
 func TestCreate_NilPublisher(t *testing.T) {
-	h := NewMessageHandler(&mockMessageRepo{}, nil, zap.NewNop())
+	h := newTestHandler(nil, nil, nil)
 	r := setupRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -168,6 +219,22 @@ func TestCreate_NilPublisher(t *testing.T) {
 	}
 }
 
+func TestCreate_BodyTooLong(t *testing.T) {
+	longBody := strings.Repeat("x", 4001)
+	h := newTestHandler(nil, nil, nil)
+	r := setupRouter(h, uuid.New(), uuid.New())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/channels/"+uuid.New().String()+"/messages",
+		strings.NewReader(`{"content":"`+longBody+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestList_Success(t *testing.T) {
 	chID := uuid.New()
 	repo := &mockMessageRepo{
@@ -178,7 +245,7 @@ func TestList_Success(t *testing.T) {
 			}, nil
 		},
 	}
-	h := NewMessageHandler(repo, nil, zap.NewNop())
+	h := newTestHandler(repo, nil, nil)
 	r := setupRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -198,7 +265,7 @@ func TestList_Success(t *testing.T) {
 }
 
 func TestList_InvalidBefore(t *testing.T) {
-	h := NewMessageHandler(&mockMessageRepo{}, nil, zap.NewNop())
+	h := newTestHandler(nil, nil, nil)
 	r := setupRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()

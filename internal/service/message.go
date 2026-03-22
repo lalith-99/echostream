@@ -97,7 +97,11 @@ func (s *MessageService) Send(ctx context.Context, tenantID, channelID, senderID
 			ChannelID: channelID.String(),
 			Message:   msg,
 		}
-		data, _ := json.Marshal(event)
+		data, err := json.Marshal(event)
+		if err != nil {
+			s.logger.Error("failed to marshal message event", zap.Error(err))
+			return msg, nil // Message is saved, just can't broadcast it
+		}
 		if err := s.publisher.Publish(ctx, channelTopicPrefix+channelID.String(), data); err != nil {
 			s.logger.Error("publish failed (message is saved, delivery is best-effort)",
 				zap.Error(err),

@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/lalith-99/echostream/internal/api"
@@ -11,8 +15,10 @@ import (
 	"github.com/lalith-99/echostream/internal/db"
 	"github.com/lalith-99/echostream/internal/middleware"
 	"github.com/lalith-99/echostream/internal/observ"
+	"github.com/lalith-99/echostream/internal/presence"
 	redisclient "github.com/lalith-99/echostream/internal/redis"
 	"github.com/lalith-99/echostream/internal/repository/postgres"
+	"github.com/lalith-99/echostream/internal/service"
 	"github.com/lalith-99/echostream/internal/websocket"
 	"go.uber.org/zap"
 )
@@ -54,7 +60,13 @@ func run() error {
 	pubsub := redisclient.NewPubSub(rc, hub, logger)
 	hub.SetChannelCallbacks(pubsub.Subscribe, pubsub.Unsubscribe)
 
+	// Presence tracker — marks users online/offline in Redis
+	tracker := presence.NewTracker(rc.RDB(), logger)
+	hub.SetPresenceTracker(tracker)
+
 	go hub.Run()
+	defer hub.Shutdown()
+
 	pubsubCtx, pubsubCancel := context.WithCancel(context.Background())
 	defer pubsubCancel()
 	go pubsub.Listen(pubsubCtx)
@@ -68,10 +80,13 @@ func run() error {
 	userRepo := postgres.NewUserStore(pool)
 	tenantRepo := postgres.NewTenantStore(pool)
 
-	// Handlers
+	// Services (business logic layer)
+	messageSvc := service.NewMessageService(messageRepo, membershipRepo, rc, logger)
+
+	// Handlers (thin HTTP adapters)
 	channelHandler := api.NewChannelHandler(channelRepo, logger)
 	membershipHandler := api.NewMembershipHandler(membershipRepo, logger)
-	messageHandler := api.NewMessageHandler(messageRepo, rc, logger)
+	messageHandler := api.NewMessageHandler(messageSvc, logger)
 	userHandler := api.NewUserHandler(userRepo, logger)
 	authHandler := api.NewAuthHandler(userRepo, tenantRepo, cfg.JWTSecret, logger)
 	wsHandler := api.NewWSHandler(hub, cfg.JWTSecret, logger)
@@ -95,6 +110,7 @@ func run() error {
 	// Authenticated routes
 	v1 := srv.Group("/v1")
 	v1.Use(middleware.AuthMiddleware(cfg.JWTSecret))
+	v1.Use(middleware.RateLimiter(rc.RDB(), 60, time.Minute)) // 60 requests/min per user
 
 	v1.POST("/channels", channelHandler.Create)
 	v1.GET("/channels", channelHandler.List)
@@ -109,7 +125,47 @@ func run() error {
 
 	v1.GET("/users/me", userHandler.GetMe)
 
-	srv.Run(":" + cfg.Port)
+	// --- Graceful shutdown ---
+	//
+	// We use http.Server instead of gin's srv.Run() so we can call
+	// Shutdown() when the process receives SIGINT (Ctrl+C) or SIGTERM
+	// (Kubernetes pod eviction, docker stop, etc.).
+	//
+	// Flow:
+	//   1. Start HTTP server in a goroutine
+	//   2. Block on OS signal
+	//   3. Call server.Shutdown (stops accepting new conns, waits for in-flight)
+	//   4. Deferred cleanup runs: pubsub → redis → postgres → logger
 
+	httpSrv := &http.Server{
+		Addr:    ":" + cfg.Port,
+		Handler: srv,
+	}
+
+	// Start serving in background
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Fatal("server failed", zap.Error(err))
+		}
+	}()
+
+	logger.Info("server is ready", zap.String("addr", httpSrv.Addr))
+
+	// Wait for interrupt signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
+	logger.Info("shutting down", zap.String("signal", sig.String()))
+
+	// Give in-flight requests 5 seconds to finish
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("forced shutdown", zap.Error(err))
+	}
+
+	logger.Info("server stopped cleanly")
+	// Deferred cleanup (pubsub, redis, postgres, logger) runs as this function returns.
 	return nil
 }
