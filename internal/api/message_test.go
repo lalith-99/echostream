@@ -59,7 +59,7 @@ func (m *mockMembershipRepo) IsMember(_ context.Context, _, _ uuid.UUID) (bool, 
 }
 func (m *mockMembershipRepo) AddMember(_ context.Context, _, _ uuid.UUID, _ string) error { return nil }
 func (m *mockMembershipRepo) RemoveMember(_ context.Context, _, _ uuid.UUID) error        { return nil }
-func (m *mockMembershipRepo) ListMembers(_ context.Context, _ uuid.UUID) ([]models.ChannelMember, error) {
+func (m *mockMembershipRepo) ListMembers(_ context.Context, _ uuid.UUID, _, _ int) ([]models.ChannelMember, error) {
 	return nil, nil
 }
 

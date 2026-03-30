@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"time"
@@ -42,7 +41,7 @@ func RateLimiter(rdb *goredis.Client, limit int, window time.Duration) gin.Handl
 		bucket := time.Now().Unix() / int64(window.Seconds())
 		key := fmt.Sprintf("rl:%s:%d", userID.String(), bucket)
 
-		ctx := context.Background()
+		ctx := c.Request.Context()
 
 		// INCR is atomic: creates key with value 1 if it doesn't exist,
 		// or increments the existing value. Either way, returns the new count.

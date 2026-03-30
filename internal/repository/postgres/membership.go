@@ -44,14 +44,15 @@ func (s *MembershipStore) RemoveMember(ctx context.Context, channelID uuid.UUID,
 	return nil
 }
 
-func (s *MembershipStore) ListMembers(ctx context.Context, channelID uuid.UUID) ([]models.ChannelMember, error) {
+func (s *MembershipStore) ListMembers(ctx context.Context, channelID uuid.UUID, limit, offset int) ([]models.ChannelMember, error) {
 	query := `
 		SELECT channel_id, user_id, role
 		FROM channel_members
 		WHERE channel_id = $1
-		ORDER BY user_id`
+		ORDER BY user_id
+		LIMIT $2 OFFSET $3`
 
-	rows, err := s.pool.Query(ctx, query, channelID)
+	rows, err := s.pool.Query(ctx, query, channelID, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list members: %w", err)
 	}

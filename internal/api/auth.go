@@ -1,11 +1,14 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lalith-99/echostream/internal/auth"
+	"github.com/lalith-99/echostream/internal/models"
 	"github.com/lalith-99/echostream/internal/repository"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
@@ -15,6 +18,7 @@ import (
 type AuthHandler struct {
 	userRepo   repository.UserRepository
 	tenantRepo repository.TenantRepository
+	pool       *pgxpool.Pool // for transactional signup
 	jwtSecret  string
 	logger     *zap.Logger
 }
@@ -23,12 +27,14 @@ type AuthHandler struct {
 func NewAuthHandler(
 	userRepo repository.UserRepository,
 	tenantRepo repository.TenantRepository,
+	pool *pgxpool.Pool,
 	jwtSecret string,
 	logger *zap.Logger,
 ) *AuthHandler {
 	return &AuthHandler{
 		userRepo:   userRepo,
 		tenantRepo: tenantRepo,
+		pool:       pool,
 		jwtSecret:  jwtSecret,
 		logger:     logger,
 	}
@@ -51,6 +57,9 @@ type authResponse struct {
 }
 
 // Signup handles POST /v1/auth/signup
+//
+// Creates tenant + user inside a single Postgres transaction.
+// If either INSERT fails, both roll back — no orphan tenants.
 func (h *AuthHandler) Signup(c *gin.Context) {
 	var req signupRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -76,29 +85,14 @@ func (h *AuthHandler) Signup(c *gin.Context) {
 		return
 	}
 
-	// Create the tenant first (user references tenant via FK).
-	tenant, err := h.tenantRepo.Create(c.Request.Context(), req.TenantName)
+	// Run both INSERTs in a single transaction.
+	tenant, user, err := h.signupTx(c.Request.Context(), req.TenantName, req.Email, req.DisplayName, string(hash))
 	if err != nil {
-		h.logger.Error("failed to create tenant", zap.Error(err))
+		h.logger.Error("signup transaction failed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "signup failed"})
 		return
 	}
 
-	// Create the user in that tenant.
-	user, err := h.userRepo.Create(
-		c.Request.Context(),
-		tenant.ID,
-		req.Email,
-		req.DisplayName,
-		string(hash),
-	)
-	if err != nil {
-		h.logger.Error("failed to create user", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "signup failed"})
-		return
-	}
-
-	// Generate a JWT valid for 24 hours.
 	token, err := auth.GenerateToken(user.ID, tenant.ID, user.Email, h.jwtSecret, 24*time.Hour)
 	if err != nil {
 		h.logger.Error("failed to generate token", zap.Error(err))
@@ -107,6 +101,42 @@ func (h *AuthHandler) Signup(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, authResponse{Token: token})
+}
+
+// signupTx creates a tenant and user in one transaction.
+// If either fails, both roll back automatically.
+func (h *AuthHandler) signupTx(ctx context.Context, tenantName, email, displayName, passwordHash string) (*models.Tenant, *models.User, error) {
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Rollback is a no-op if Commit() already succeeded.
+	defer tx.Rollback(ctx)
+
+	var tenant models.Tenant
+	err = tx.QueryRow(ctx,
+		`INSERT INTO tenants (name, created_at) VALUES ($1, now()) RETURNING id, name, created_at`,
+		tenantName,
+	).Scan(&tenant.ID, &tenant.Name, &tenant.CreatedAt)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var user models.User
+	err = tx.QueryRow(ctx,
+		`INSERT INTO users (tenant_id, email, display_name, password_hash, created_at)
+		 VALUES ($1, $2, $3, $4, now())
+		 RETURNING id, tenant_id, email, display_name, password_hash, created_at`,
+		tenant.ID, email, displayName, passwordHash,
+	).Scan(&user.ID, &user.TenantID, &user.Email, &user.DisplayName, &user.PasswordHash, &user.CreatedAt)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, err
+	}
+	return &tenant, &user, nil
 }
 
 // Login handles POST /v1/auth/login

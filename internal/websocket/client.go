@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"context"
 	"encoding/json"
 	"time"
 
@@ -17,24 +18,30 @@ const (
 	sendBufSize    = 256
 )
 
+// MembershipChecker verifies whether a user belongs to a channel.
+// Injected from the api layer so the websocket package doesn't import repository.
+type MembershipChecker func(ctx context.Context, channelID, userID uuid.UUID) (bool, error)
+
 type Client struct {
-	hub      *Hub
-	conn     *gorillaws.Conn
-	send     chan []byte
-	userID   uuid.UUID
-	tenantID uuid.UUID
-	logger   *zap.Logger
+	hub             *Hub
+	conn            *gorillaws.Conn
+	send            chan []byte
+	userID          uuid.UUID
+	tenantID        uuid.UUID
+	checkMembership MembershipChecker // nil = skip check (backwards compat for tests)
+	logger          *zap.Logger
 }
 
 // NewClient creates a websocket client bound to a hub.
-func NewClient(hub *Hub, conn *gorillaws.Conn, userID, tenantID uuid.UUID, logger *zap.Logger) *Client {
+func NewClient(hub *Hub, conn *gorillaws.Conn, userID, tenantID uuid.UUID, checker MembershipChecker, logger *zap.Logger) *Client {
 	return &Client{
-		hub:      hub,
-		conn:     conn,
-		send:     make(chan []byte, sendBufSize),
-		userID:   userID,
-		tenantID: tenantID,
-		logger:   logger,
+		hub:             hub,
+		conn:            conn,
+		send:            make(chan []byte, sendBufSize),
+		userID:          userID,
+		tenantID:        tenantID,
+		checkMembership: checker,
+		logger:          logger,
 	}
 }
 
@@ -114,6 +121,19 @@ func (c *Client) handleMessage(msg InboundMessage) {
 		if err != nil {
 			c.sendError("invalid channel_id")
 			return
+		}
+		// Verify caller is a member before subscribing to real-time events
+		if c.checkMembership != nil {
+			ok, err := c.checkMembership(context.Background(), channelID, c.userID)
+			if err != nil {
+				c.logger.Error("membership check failed", zap.Error(err))
+				c.sendError("internal error")
+				return
+			}
+			if !ok {
+				c.sendError("not a member of this channel")
+				return
+			}
 		}
 		c.hub.subscribeCh <- &subscription{client: c, channelID: channelID}
 

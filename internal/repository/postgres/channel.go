@@ -63,14 +63,15 @@ func (s *ChannelStore) GetByID(ctx context.Context, tenantID uuid.UUID, channelI
 	return &ch, nil
 }
 
-func (s *ChannelStore) ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]models.Channel, error) {
+func (s *ChannelStore) ListByTenant(ctx context.Context, tenantID uuid.UUID, limit, offset int) ([]models.Channel, error) {
 	query := `
 		SELECT id, tenant_id, name, is_private, created_at
 		FROM channels
 		WHERE tenant_id = $1
-		ORDER BY created_at DESC`
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3`
 
-	rows, err := s.pool.Query(ctx, query, tenantID)
+	rows, err := s.pool.Query(ctx, query, tenantID, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list channels: %w", err)
 	}

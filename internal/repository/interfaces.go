@@ -16,8 +16,8 @@ type ChannelRepository interface {
 	// GetByID returns a single channel. Returns nil, nil if not found.
 	GetByID(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID) (*models.Channel, error)
 
-	// ListByTenant returns all channels for a tenant, newest first.
-	ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]models.Channel, error)
+	// ListByTenant returns channels for a tenant, newest first, with pagination.
+	ListByTenant(ctx context.Context, tenantID uuid.UUID, limit, offset int) ([]models.Channel, error)
 }
 
 // MembershipRepository handles who belongs to which channel.
@@ -28,8 +28,8 @@ type MembershipRepository interface {
 	// RemoveMember removes a user from a channel. No-op if not a member.
 	RemoveMember(ctx context.Context, channelID uuid.UUID, userID uuid.UUID) error
 
-	// ListMembers returns all members of a channel.
-	ListMembers(ctx context.Context, channelID uuid.UUID) ([]models.ChannelMember, error)
+	// ListMembers returns members of a channel with pagination.
+	ListMembers(ctx context.Context, channelID uuid.UUID, limit, offset int) ([]models.ChannelMember, error)
 
 	// IsMember checks if a user belongs to a channel.
 	IsMember(ctx context.Context, channelID uuid.UUID, userID uuid.UUID) (bool, error)

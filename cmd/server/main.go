@@ -85,11 +85,11 @@ func run() error {
 
 	// Handlers (thin HTTP adapters)
 	channelHandler := api.NewChannelHandler(channelRepo, logger)
-	membershipHandler := api.NewMembershipHandler(membershipRepo, logger)
+	membershipHandler := api.NewMembershipHandler(membershipRepo, channelRepo, logger)
 	messageHandler := api.NewMessageHandler(messageSvc, logger)
 	userHandler := api.NewUserHandler(userRepo, logger)
-	authHandler := api.NewAuthHandler(userRepo, tenantRepo, cfg.JWTSecret, logger)
-	wsHandler := api.NewWSHandler(hub, cfg.JWTSecret, logger)
+	authHandler := api.NewAuthHandler(userRepo, tenantRepo, pool, cfg.JWTSecret, logger)
+	wsHandler := api.NewWSHandler(hub, membershipRepo, cfg.JWTSecret, logger)
 
 	srv := gin.New()
 	srv.Use(gin.Logger(), gin.Recovery())

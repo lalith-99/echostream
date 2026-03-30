@@ -25,11 +25,18 @@ type createChannelRequest struct {
 	IsPrivate bool   `json:"is_private"`
 }
 
+const maxChannelNameLen = 80
+
 // Create handles POST /v1/channels
 func (h *ChannelHandler) Create(c *gin.Context) {
 	var req createChannelRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if len(req.Name) > maxChannelNameLen {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "channel name must be 80 characters or less"})
 		return
 	}
 
@@ -45,11 +52,13 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 	c.JSON(http.StatusCreated, ch)
 }
 
-// List handles GET /v1/channels
+// List handles GET /v1/channels?limit=50&offset=0
 func (h *ChannelHandler) List(c *gin.Context) {
 	tenantID := middleware.GetTenantID(c)
 
-	channels, err := h.repo.ListByTenant(c.Request.Context(), tenantID)
+	limit, offset := parsePagination(c, 50, 100)
+
+	channels, err := h.repo.ListByTenant(c.Request.Context(), tenantID, limit, offset)
 	if err != nil {
 		h.logger.Error("failed to list channels", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list channels"})

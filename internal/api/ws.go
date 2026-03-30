@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 	gorillaws "github.com/gorilla/websocket"
 	"github.com/lalith-99/echostream/internal/auth"
+	"github.com/lalith-99/echostream/internal/repository"
 	"github.com/lalith-99/echostream/internal/websocket"
 	"go.uber.org/zap"
 )
@@ -13,7 +14,7 @@ import (
 const (
 	wsBufferSize = 1024
 
-	wsTokenQuery  = "token"
+	wsTokenQuery   = "token"
 	wsOriginHeader = "Origin"
 
 	wsErrMissingToken = "missing token query parameter"
@@ -36,14 +37,15 @@ var upgrader = gorillaws.Upgrader{
 }
 
 type WSHandler struct {
-	hub       *websocket.Hub
-	jwtSecret string
-	logger    *zap.Logger
+	hub            *websocket.Hub
+	membershipRepo repository.MembershipRepository
+	jwtSecret      string
+	logger         *zap.Logger
 }
 
 // NewWSHandler creates a WebSocket handler.
-func NewWSHandler(hub *websocket.Hub, jwtSecret string, logger *zap.Logger) *WSHandler {
-	return &WSHandler{hub: hub, jwtSecret: jwtSecret, logger: logger}
+func NewWSHandler(hub *websocket.Hub, membershipRepo repository.MembershipRepository, jwtSecret string, logger *zap.Logger) *WSHandler {
+	return &WSHandler{hub: hub, membershipRepo: membershipRepo, jwtSecret: jwtSecret, logger: logger}
 }
 
 // HandleWS upgrades HTTP to WebSocket. Auth via ?token=<jwt> query param
@@ -67,7 +69,7 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 		return
 	}
 
-	client := websocket.NewClient(h.hub, conn, claims.UserID, claims.TenantID, h.logger)
+	client := websocket.NewClient(h.hub, conn, claims.UserID, claims.TenantID, h.membershipRepo.IsMember, h.logger)
 	h.hub.Register(client)
 
 	go client.WritePump()
