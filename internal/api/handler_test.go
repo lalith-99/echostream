@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/lalith-99/echostream/internal/middleware"
 	"github.com/lalith-99/echostream/internal/models"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // --- channel mock ---
@@ -416,5 +418,273 @@ func TestListMembers_InvalidChannelID(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// ==========================================================================
+// Auth handler tests
+// ==========================================================================
+
+// --- auth mocks ---
+
+type mockUserRepo struct {
+	getByEmailFn func(ctx context.Context, email string) (*models.User, error)
+	createFn     func(ctx context.Context, tenantID uuid.UUID, email, displayName, passwordHash string) (*models.User, error)
+	getByIDFn    func(ctx context.Context, tenantID, userID uuid.UUID) (*models.User, error)
+}
+
+func (m *mockUserRepo) GetByEmail(ctx context.Context, email string) (*models.User, error) {
+	if m.getByEmailFn != nil {
+		return m.getByEmailFn(ctx, email)
+	}
+	return nil, nil // default: user not found
+}
+
+func (m *mockUserRepo) Create(ctx context.Context, tenantID uuid.UUID, email, displayName, passwordHash string) (*models.User, error) {
+	if m.createFn != nil {
+		return m.createFn(ctx, tenantID, email, displayName, passwordHash)
+	}
+	return &models.User{ID: uuid.New(), TenantID: tenantID, Email: email, DisplayName: displayName}, nil
+}
+
+func (m *mockUserRepo) GetByID(ctx context.Context, tenantID, userID uuid.UUID) (*models.User, error) {
+	if m.getByIDFn != nil {
+		return m.getByIDFn(ctx, tenantID, userID)
+	}
+	return nil, nil
+}
+
+type mockSignupRepo struct {
+	tenant *models.Tenant
+	user   *models.User
+	err    error
+}
+
+func (m *mockSignupRepo) CreateTenantAndUser(_ context.Context, _, _, _, _ string) (*models.Tenant, *models.User, error) {
+	return m.tenant, m.user, m.err
+}
+
+const testJWTSecret = "test-secret-key-for-unit-tests"
+
+func authRouter(h *AuthHandler) *gin.Engine {
+	r := gin.New()
+	r.POST("/v1/auth/signup", h.Signup)
+	r.POST("/v1/auth/login", h.Login)
+	return r
+}
+
+// --- auth tests ---
+
+func TestSignup_Success(t *testing.T) {
+	tid := uuid.New()
+	uid := uuid.New()
+
+	h := NewAuthHandler(
+		&mockUserRepo{}, // GetByEmail returns nil → no existing user
+		&mockSignupRepo{
+			tenant: &models.Tenant{ID: tid, Name: "Acme"},
+			user:   &models.User{ID: uid, TenantID: tid, Email: "a@b.com", DisplayName: "Alice"},
+		},
+		testJWTSecret,
+		zap.NewNop(),
+	)
+	r := authRouter(h)
+
+	w := httptest.NewRecorder()
+	body := `{"email":"a@b.com","password":"securepass","display_name":"Alice","tenant_name":"Acme"}`
+	req, _ := http.NewRequest("POST", "/v1/auth/signup", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp authResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Token == "" {
+		t.Fatal("expected a JWT token in response")
+	}
+}
+
+func TestSignup_DuplicateEmail(t *testing.T) {
+	existing := &models.User{ID: uuid.New(), Email: "taken@b.com"}
+	h := NewAuthHandler(
+		&mockUserRepo{
+			getByEmailFn: func(_ context.Context, _ string) (*models.User, error) {
+				return existing, nil
+			},
+		},
+		&mockSignupRepo{},
+		testJWTSecret,
+		zap.NewNop(),
+	)
+	r := authRouter(h)
+
+	w := httptest.NewRecorder()
+	body := `{"email":"taken@b.com","password":"securepass","display_name":"Bob","tenant_name":"Acme"}`
+	req, _ := http.NewRequest("POST", "/v1/auth/signup", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSignup_MissingFields(t *testing.T) {
+	h := NewAuthHandler(&mockUserRepo{}, &mockSignupRepo{}, testJWTSecret, zap.NewNop())
+	r := authRouter(h)
+
+	// missing tenant_name
+	w := httptest.NewRecorder()
+	body := `{"email":"a@b.com","password":"securepass","display_name":"Alice"}`
+	req, _ := http.NewRequest("POST", "/v1/auth/signup", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSignup_ShortPassword(t *testing.T) {
+	h := NewAuthHandler(&mockUserRepo{}, &mockSignupRepo{}, testJWTSecret, zap.NewNop())
+	r := authRouter(h)
+
+	w := httptest.NewRecorder()
+	body := `{"email":"a@b.com","password":"short","display_name":"Alice","tenant_name":"Acme"}`
+	req, _ := http.NewRequest("POST", "/v1/auth/signup", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for short password, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestSignup_RepoError(t *testing.T) {
+	h := NewAuthHandler(
+		&mockUserRepo{},
+		&mockSignupRepo{err: errors.New("db down")},
+		testJWTSecret,
+		zap.NewNop(),
+	)
+	r := authRouter(h)
+
+	w := httptest.NewRecorder()
+	body := `{"email":"a@b.com","password":"securepass","display_name":"Alice","tenant_name":"Acme"}`
+	req, _ := http.NewRequest("POST", "/v1/auth/signup", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+}
+
+func TestLogin_Success(t *testing.T) {
+	hash, _ := bcrypt.GenerateFromPassword([]byte("correctpass"), bcrypt.MinCost)
+	uid, tid := uuid.New(), uuid.New()
+
+	h := NewAuthHandler(
+		&mockUserRepo{
+			getByEmailFn: func(_ context.Context, _ string) (*models.User, error) {
+				return &models.User{
+					ID:           uid,
+					TenantID:     tid,
+					Email:        "a@b.com",
+					PasswordHash: string(hash),
+				}, nil
+			},
+		},
+		&mockSignupRepo{},
+		testJWTSecret,
+		zap.NewNop(),
+	)
+	r := authRouter(h)
+
+	w := httptest.NewRecorder()
+	body := `{"email":"a@b.com","password":"correctpass"}`
+	req, _ := http.NewRequest("POST", "/v1/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp authResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Token == "" {
+		t.Fatal("expected a JWT token")
+	}
+}
+
+func TestLogin_WrongPassword(t *testing.T) {
+	hash, _ := bcrypt.GenerateFromPassword([]byte("correctpass"), bcrypt.MinCost)
+
+	h := NewAuthHandler(
+		&mockUserRepo{
+			getByEmailFn: func(_ context.Context, _ string) (*models.User, error) {
+				return &models.User{
+					ID:           uuid.New(),
+					TenantID:     uuid.New(),
+					Email:        "a@b.com",
+					PasswordHash: string(hash),
+				}, nil
+			},
+		},
+		&mockSignupRepo{},
+		testJWTSecret,
+		zap.NewNop(),
+	)
+	r := authRouter(h)
+
+	w := httptest.NewRecorder()
+	body := `{"email":"a@b.com","password":"wrongpass1"}`
+	req, _ := http.NewRequest("POST", "/v1/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestLogin_UserNotFound(t *testing.T) {
+	h := NewAuthHandler(
+		&mockUserRepo{}, // GetByEmail returns nil
+		&mockSignupRepo{},
+		testJWTSecret,
+		zap.NewNop(),
+	)
+	r := authRouter(h)
+
+	w := httptest.NewRecorder()
+	body := `{"email":"nobody@b.com","password":"whatever1"}`
+	req, _ := http.NewRequest("POST", "/v1/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestLogin_MissingFields(t *testing.T) {
+	h := NewAuthHandler(&mockUserRepo{}, &mockSignupRepo{}, testJWTSecret, zap.NewNop())
+	r := authRouter(h)
+
+	w := httptest.NewRecorder()
+	body := `{"email":"a@b.com"}`
+	req, _ := http.NewRequest("POST", "/v1/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 }

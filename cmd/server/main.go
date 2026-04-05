@@ -78,7 +78,7 @@ func run() error {
 	membershipRepo := postgres.NewMembershipStore(pool)
 	messageRepo := postgres.NewMessageStore(pool)
 	userRepo := postgres.NewUserStore(pool)
-	tenantRepo := postgres.NewTenantStore(pool)
+	signupRepo := postgres.NewSignupStore(pool)
 
 	// Services (business logic layer)
 	messageSvc := service.NewMessageService(messageRepo, membershipRepo, rc, logger)
@@ -88,7 +88,7 @@ func run() error {
 	membershipHandler := api.NewMembershipHandler(membershipRepo, channelRepo, logger)
 	messageHandler := api.NewMessageHandler(messageSvc, logger)
 	userHandler := api.NewUserHandler(userRepo, logger)
-	authHandler := api.NewAuthHandler(userRepo, tenantRepo, pool, cfg.JWTSecret, logger)
+	authHandler := api.NewAuthHandler(userRepo, signupRepo, cfg.JWTSecret, logger)
 	wsHandler := api.NewWSHandler(hub, membershipRepo, cfg.JWTSecret, logger)
 
 	srv := gin.New()

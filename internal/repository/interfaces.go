@@ -60,3 +60,10 @@ type UserRepository interface {
 type TenantRepository interface {
 	Create(ctx context.Context, name string) (*models.Tenant, error)
 }
+
+// SignupRepository atomically creates a tenant + user in one operation.
+// The underlying implementation uses a database transaction so that
+// a failure in user creation doesn't leave orphan tenants.
+type SignupRepository interface {
+	CreateTenantAndUser(ctx context.Context, tenantName, email, displayName, passwordHash string) (*models.Tenant, *models.User, error)
+}
