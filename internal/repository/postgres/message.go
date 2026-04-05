@@ -20,12 +20,12 @@ func NewMessageStore(pool *pgxpool.Pool) *MessageStore {
 
 func (s *MessageStore) Create(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID, senderID uuid.UUID, body string) (*models.Message, error) {
 	query := `
-		INSERT INTO messages (channel_id, sender_id, body, created_at)
-		VALUES ($1, $2, $3, now())
+		INSERT INTO messages (tenant_id, channel_id, sender_id, body, created_at)
+		VALUES ($1, $2, $3, $4, now())
 		RETURNING id, channel_id, sender_id, body, created_at`
 
 	var msg models.Message
-	err := s.pool.QueryRow(ctx, query, channelID, senderID, body).Scan(
+	err := s.pool.QueryRow(ctx, query, tenantID, channelID, senderID, body).Scan(
 		&msg.ID,
 		&msg.ChannelID,
 		&msg.SenderID,
@@ -40,6 +40,8 @@ func (s *MessageStore) Create(ctx context.Context, tenantID uuid.UUID, channelID
 
 func (s *MessageStore) ListByChannel(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID, before int64, limit int) ([]models.Message, error) {
 	// Cursor-based pagination: before=0 means latest, before=N means older than ID N.
+	// tenant_id in WHERE clause = defense-in-depth: even if someone guesses a
+	// channel UUID, the query won't return rows from another tenant.
 	var query string
 	var args []any
 
@@ -47,18 +49,18 @@ func (s *MessageStore) ListByChannel(ctx context.Context, tenantID uuid.UUID, ch
 		query = `
 			SELECT id, channel_id, sender_id, body, created_at
 			FROM messages
-			WHERE channel_id = $1 AND id < $2
+			WHERE tenant_id = $1 AND channel_id = $2 AND id < $3
 			ORDER BY id DESC
-			LIMIT $3`
-		args = []any{channelID, before, limit}
+			LIMIT $4`
+		args = []any{tenantID, channelID, before, limit}
 	} else {
 		query = `
 			SELECT id, channel_id, sender_id, body, created_at
 			FROM messages
-			WHERE channel_id = $1
+			WHERE tenant_id = $1 AND channel_id = $2
 			ORDER BY id DESC
-			LIMIT $2`
-		args = []any{channelID, limit}
+			LIMIT $3`
+		args = []any{tenantID, channelID, limit}
 	}
 
 	rows, err := s.pool.Query(ctx, query, args...)

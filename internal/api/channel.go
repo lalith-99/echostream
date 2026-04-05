@@ -11,13 +11,14 @@ import (
 )
 
 type ChannelHandler struct {
-	repo   repository.ChannelRepository
-	logger *zap.Logger
+	repo       repository.ChannelRepository
+	membership repository.MembershipRepository
+	logger     *zap.Logger
 }
 
 // NewChannelHandler returns a ChannelHandler.
-func NewChannelHandler(repo repository.ChannelRepository, logger *zap.Logger) *ChannelHandler {
-	return &ChannelHandler{repo: repo, logger: logger}
+func NewChannelHandler(repo repository.ChannelRepository, membership repository.MembershipRepository, logger *zap.Logger) *ChannelHandler {
+	return &ChannelHandler{repo: repo, membership: membership, logger: logger}
 }
 
 type createChannelRequest struct {
@@ -50,6 +51,13 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, ch)
+
+	// Auto-add the creator as the first admin member.
+	// This runs after the response is sent (best-effort). If it fails, the
+	// creator can still join manually, but we log the error.
+	if err := h.membership.AddMember(c.Request.Context(), ch.ID, middleware.GetUserID(c), "admin"); err != nil {
+		h.logger.Error("failed to add creator as admin", zap.Error(err))
+	}
 }
 
 // List handles GET /v1/channels?limit=50&offset=0

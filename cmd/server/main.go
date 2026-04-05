@@ -84,7 +84,7 @@ func run() error {
 	messageSvc := service.NewMessageService(messageRepo, membershipRepo, rc, logger)
 
 	// Handlers (thin HTTP adapters)
-	channelHandler := api.NewChannelHandler(channelRepo, logger)
+	channelHandler := api.NewChannelHandler(channelRepo, membershipRepo, logger)
 	membershipHandler := api.NewMembershipHandler(membershipRepo, channelRepo, logger)
 	messageHandler := api.NewMessageHandler(messageSvc, logger)
 	userHandler := api.NewUserHandler(userRepo, logger)
@@ -121,6 +121,7 @@ func run() error {
 
 	v1.POST("/channels/:id/join", membershipHandler.Join)
 	v1.POST("/channels/:id/leave", membershipHandler.Leave)
+	v1.POST("/channels/:id/invite", membershipHandler.Invite)
 	v1.GET("/channels/:id/members", membershipHandler.ListMembers)
 
 	v1.GET("/users/me", userHandler.GetMe)

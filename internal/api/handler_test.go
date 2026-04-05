@@ -64,7 +64,7 @@ func channelRouter(h *ChannelHandler, uid, tid uuid.UUID) *gin.Engine {
 // --- tests ---
 
 func TestChannelCreate_Success(t *testing.T) {
-	h := NewChannelHandler(&mockChannelRepo{}, zap.NewNop())
+	h := NewChannelHandler(&mockChannelRepo{}, &mockMembershipRepoFull{}, zap.NewNop())
 	r := channelRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -79,7 +79,7 @@ func TestChannelCreate_Success(t *testing.T) {
 }
 
 func TestChannelCreate_MissingName(t *testing.T) {
-	h := NewChannelHandler(&mockChannelRepo{}, zap.NewNop())
+	h := NewChannelHandler(&mockChannelRepo{}, &mockMembershipRepoFull{}, zap.NewNop())
 	r := channelRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -95,7 +95,7 @@ func TestChannelCreate_MissingName(t *testing.T) {
 
 func TestChannelCreate_NameTooLong(t *testing.T) {
 	longName := strings.Repeat("a", 81)
-	h := NewChannelHandler(&mockChannelRepo{}, zap.NewNop())
+	h := NewChannelHandler(&mockChannelRepo{}, &mockMembershipRepoFull{}, zap.NewNop())
 	r := channelRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -111,7 +111,7 @@ func TestChannelCreate_NameTooLong(t *testing.T) {
 
 func TestChannelCreate_Name80Chars(t *testing.T) {
 	exactName := strings.Repeat("b", 80)
-	h := NewChannelHandler(&mockChannelRepo{}, zap.NewNop())
+	h := NewChannelHandler(&mockChannelRepo{}, &mockMembershipRepoFull{}, zap.NewNop())
 	r := channelRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -134,7 +134,7 @@ func TestChannelList_PassesPagination(t *testing.T) {
 			return []models.Channel{}, nil
 		},
 	}
-	h := NewChannelHandler(repo, zap.NewNop())
+	h := NewChannelHandler(repo, &mockMembershipRepoFull{}, zap.NewNop())
 	r := channelRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -161,7 +161,7 @@ func TestChannelList_DefaultPagination(t *testing.T) {
 			return []models.Channel{}, nil
 		},
 	}
-	h := NewChannelHandler(repo, zap.NewNop())
+	h := NewChannelHandler(repo, &mockMembershipRepoFull{}, zap.NewNop())
 	r := channelRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -182,7 +182,7 @@ func TestChannelGetByID_NotFound(t *testing.T) {
 			return nil, nil
 		},
 	}
-	h := NewChannelHandler(repo, zap.NewNop())
+	h := NewChannelHandler(repo, &mockMembershipRepoFull{}, zap.NewNop())
 	r := channelRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -195,7 +195,7 @@ func TestChannelGetByID_NotFound(t *testing.T) {
 }
 
 func TestChannelGetByID_InvalidID(t *testing.T) {
-	h := NewChannelHandler(&mockChannelRepo{}, zap.NewNop())
+	h := NewChannelHandler(&mockChannelRepo{}, &mockMembershipRepoFull{}, zap.NewNop())
 	r := channelRouter(h, uuid.New(), uuid.New())
 
 	w := httptest.NewRecorder()
@@ -240,6 +240,7 @@ func membershipRouter(h *MembershipHandler, uid, tid uuid.UUID) *gin.Engine {
 	})
 	r.POST("/v1/channels/:id/join", h.Join)
 	r.POST("/v1/channels/:id/leave", h.Leave)
+	r.POST("/v1/channels/:id/invite", h.Invite)
 	r.GET("/v1/channels/:id/members", h.ListMembers)
 	return r
 }
@@ -687,4 +688,278 @@ func TestLogin_MissingFields(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
 	}
+}
+
+// ==========================================================================
+// Private channel enforcement tests
+// ==========================================================================
+
+func TestJoin_PrivateChannel_NotInvited(t *testing.T) {
+	tid := uuid.New()
+	chID := uuid.New()
+	chRepo := &mockChannelRepo{
+		getByIDFn: func(_ context.Context, _, _ uuid.UUID) (*models.Channel, error) {
+			return &models.Channel{ID: chID, TenantID: tid, IsPrivate: true}, nil
+		},
+	}
+	// isMember defaults to false → user hasn't been invited
+	h := NewMembershipHandler(&mockMembershipRepoFull{isMember: false}, chRepo, zap.NewNop())
+	r := membershipRouter(h, uuid.New(), tid)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/channels/"+chID.String()+"/join",
+		strings.NewReader(`{"role":"member"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for private channel without invite, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestJoin_PrivateChannel_Invited(t *testing.T) {
+	tid := uuid.New()
+	chID := uuid.New()
+	chRepo := &mockChannelRepo{
+		getByIDFn: func(_ context.Context, _, _ uuid.UUID) (*models.Channel, error) {
+			return &models.Channel{ID: chID, TenantID: tid, IsPrivate: true}, nil
+		},
+	}
+	// isMember=true → user was previously invited
+	h := NewMembershipHandler(&mockMembershipRepoFull{isMember: true}, chRepo, zap.NewNop())
+	r := membershipRouter(h, uuid.New(), tid)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/channels/"+chID.String()+"/join",
+		strings.NewReader(`{"role":"member"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for invited user joining private channel, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestJoin_PublicChannel_NoMembershipCheckNeeded(t *testing.T) {
+	tid := uuid.New()
+	chID := uuid.New()
+	chRepo := &mockChannelRepo{
+		getByIDFn: func(_ context.Context, _, _ uuid.UUID) (*models.Channel, error) {
+			return &models.Channel{ID: chID, TenantID: tid, IsPrivate: false}, nil
+		},
+	}
+	// isMember=false, but public channels don't check membership
+	h := NewMembershipHandler(&mockMembershipRepoFull{isMember: false}, chRepo, zap.NewNop())
+	r := membershipRouter(h, uuid.New(), tid)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/channels/"+chID.String()+"/join",
+		strings.NewReader(`{"role":"member"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for public channel join, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ==========================================================================
+// Invite endpoint tests
+// ==========================================================================
+
+func TestInvite_Success(t *testing.T) {
+	tid := uuid.New()
+	chID := uuid.New()
+	callerID := uuid.New()
+	targetID := uuid.New()
+
+	chRepo := &mockChannelRepo{
+		getByIDFn: func(_ context.Context, _, _ uuid.UUID) (*models.Channel, error) {
+			return &models.Channel{ID: chID, TenantID: tid, IsPrivate: true}, nil
+		},
+	}
+	// caller is a member
+	h := NewMembershipHandler(&mockMembershipRepoFull{isMember: true}, chRepo, zap.NewNop())
+	r := membershipRouter(h, callerID, tid)
+
+	w := httptest.NewRecorder()
+	body := `{"user_id":"` + targetID.String() + `"}`
+	req, _ := http.NewRequest("POST", "/v1/channels/"+chID.String()+"/invite",
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 for valid invite, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestInvite_CallerNotMember(t *testing.T) {
+	tid := uuid.New()
+	chID := uuid.New()
+	targetID := uuid.New()
+
+	chRepo := &mockChannelRepo{
+		getByIDFn: func(_ context.Context, _, _ uuid.UUID) (*models.Channel, error) {
+			return &models.Channel{ID: chID, TenantID: tid}, nil
+		},
+	}
+	// caller is NOT a member
+	h := NewMembershipHandler(&mockMembershipRepoFull{isMember: false}, chRepo, zap.NewNop())
+	r := membershipRouter(h, uuid.New(), tid)
+
+	w := httptest.NewRecorder()
+	body := `{"user_id":"` + targetID.String() + `"}`
+	req, _ := http.NewRequest("POST", "/v1/channels/"+chID.String()+"/invite",
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for non-member inviting, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestInvite_InvalidUserID(t *testing.T) {
+	tid := uuid.New()
+	chID := uuid.New()
+
+	chRepo := &mockChannelRepo{
+		getByIDFn: func(_ context.Context, _, _ uuid.UUID) (*models.Channel, error) {
+			return &models.Channel{ID: chID, TenantID: tid}, nil
+		},
+	}
+	h := NewMembershipHandler(&mockMembershipRepoFull{isMember: true}, chRepo, zap.NewNop())
+	r := membershipRouter(h, uuid.New(), tid)
+
+	w := httptest.NewRecorder()
+	body := `{"user_id":"not-a-uuid"}`
+	req, _ := http.NewRequest("POST", "/v1/channels/"+chID.String()+"/invite",
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid user_id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestInvite_MissingBody(t *testing.T) {
+	tid := uuid.New()
+	chID := uuid.New()
+
+	chRepo := &mockChannelRepo{
+		getByIDFn: func(_ context.Context, _, _ uuid.UUID) (*models.Channel, error) {
+			return &models.Channel{ID: chID, TenantID: tid}, nil
+		},
+	}
+	h := NewMembershipHandler(&mockMembershipRepoFull{isMember: true}, chRepo, zap.NewNop())
+	r := membershipRouter(h, uuid.New(), tid)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/channels/"+chID.String()+"/invite", nil)
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing body, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestInvite_ChannelNotFound(t *testing.T) {
+	chRepo := &mockChannelRepo{
+		getByIDFn: func(_ context.Context, _, _ uuid.UUID) (*models.Channel, error) {
+			return nil, nil
+		},
+	}
+	h := NewMembershipHandler(&mockMembershipRepoFull{isMember: true}, chRepo, zap.NewNop())
+	r := membershipRouter(h, uuid.New(), uuid.New())
+
+	w := httptest.NewRecorder()
+	body := `{"user_id":"` + uuid.New().String() + `"}`
+	req, _ := http.NewRequest("POST", "/v1/channels/"+uuid.New().String()+"/invite",
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for channel not found, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ==========================================================================
+// Channel create auto-adds creator as admin
+// ==========================================================================
+
+func TestChannelCreate_AddsCreatorAsAdmin(t *testing.T) {
+	uid := uuid.New()
+	tid := uuid.New()
+	createdCh := &models.Channel{ID: uuid.New(), TenantID: tid, Name: "secret"}
+
+	var addedChannelID, addedUserID uuid.UUID
+	var addedRole string
+
+	memRepo := &mockMembershipRepoFull{}
+	// Override AddMember to capture the call
+	customMemRepo := &capturingMembershipRepo{
+		MembershipRepoFull: memRepo,
+		onAdd: func(chID, uID uuid.UUID, role string) {
+			addedChannelID = chID
+			addedUserID = uID
+			addedRole = role
+		},
+	}
+
+	chRepo := &mockChannelRepo{
+		createFn: func(_ context.Context, _ uuid.UUID, _ string, _ bool) (*models.Channel, error) {
+			return createdCh, nil
+		},
+	}
+	h := NewChannelHandler(chRepo, customMemRepo, zap.NewNop())
+	r := channelRouter(h, uid, tid)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/channels",
+		strings.NewReader(`{"name":"secret","is_private":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	if addedChannelID != createdCh.ID {
+		t.Fatalf("expected AddMember called with channel %s, got %s", createdCh.ID, addedChannelID)
+	}
+	if addedUserID != uid {
+		t.Fatalf("expected AddMember called with user %s, got %s", uid, addedUserID)
+	}
+	if addedRole != "admin" {
+		t.Fatalf("expected AddMember called with role 'admin', got '%s'", addedRole)
+	}
+}
+
+// capturingMembershipRepo wraps mockMembershipRepoFull but captures AddMember calls.
+type capturingMembershipRepo struct {
+	*mockMembershipRepoFull
+	MembershipRepoFull *mockMembershipRepoFull
+	onAdd              func(channelID, userID uuid.UUID, role string)
+}
+
+func (c *capturingMembershipRepo) AddMember(_ context.Context, channelID, userID uuid.UUID, role string) error {
+	if c.onAdd != nil {
+		c.onAdd(channelID, userID, role)
+	}
+	return nil
+}
+
+func (c *capturingMembershipRepo) RemoveMember(ctx context.Context, chID, uID uuid.UUID) error {
+	return c.MembershipRepoFull.RemoveMember(ctx, chID, uID)
+}
+
+func (c *capturingMembershipRepo) ListMembers(ctx context.Context, chID uuid.UUID, limit, offset int) ([]models.ChannelMember, error) {
+	return c.MembershipRepoFull.ListMembers(ctx, chID, limit, offset)
+}
+
+func (c *capturingMembershipRepo) IsMember(ctx context.Context, chID, uID uuid.UUID) (bool, error) {
+	return c.MembershipRepoFull.IsMember(ctx, chID, uID)
 }
