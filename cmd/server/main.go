@@ -90,6 +90,7 @@ func run() error {
 	userHandler := api.NewUserHandler(userRepo, logger)
 	authHandler := api.NewAuthHandler(userRepo, signupRepo, cfg.JWTSecret, logger)
 	wsHandler := api.NewWSHandler(hub, membershipRepo, cfg.JWTSecret, logger)
+	presenceHandler := api.NewPresenceHandler(channelRepo, membershipRepo, tracker, logger)
 
 	srv := gin.New()
 	srv.Use(gin.Logger(), gin.Recovery())
@@ -123,6 +124,7 @@ func run() error {
 	v1.POST("/channels/:id/leave", membershipHandler.Leave)
 	v1.POST("/channels/:id/invite", membershipHandler.Invite)
 	v1.GET("/channels/:id/members", membershipHandler.ListMembers)
+	v1.GET("/channels/:id/presence", presenceHandler.GetChannelPresence)
 
 	v1.GET("/users/me", userHandler.GetMe)
 

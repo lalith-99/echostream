@@ -9,9 +9,10 @@ type InboundMessage struct {
 
 // OutboundEvent is sent from the server to the client over WebSocket.
 type OutboundEvent struct {
-	Type      string `json:"type"` // message, typing, subscribed, unsubscribed, error
+	Type      string `json:"type"` // message, typing, subscribed, unsubscribed, presence_change, error
 	ChannelID string `json:"channel_id,omitempty"`
 	Message   any    `json:"message,omitempty"`
 	UserID    string `json:"user_id,omitempty"`
+	Status    string `json:"status,omitempty"` // "online" or "offline" (presence_change events)
 	Error     string `json:"error,omitempty"`
 }

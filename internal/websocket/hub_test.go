@@ -249,3 +249,79 @@ func TestClient_Send_NonBlocking(t *testing.T) {
 		t.Fatal("Send blocked on full buffer")
 	}
 }
+
+func TestPresenceBroadcastOnSubscribe(t *testing.T) {
+	hub := startHub(t)
+	chID := uuid.New()
+
+	// Register two users and subscribe the first to the channel.
+	alice := fakeClient(hub, uuid.New())
+	bob := fakeClient(hub, uuid.New())
+
+	hub.register <- alice
+	hub.register <- bob
+	time.Sleep(50 * time.Millisecond)
+
+	hub.subscribeCh <- &subscription{client: alice, channelID: chID}
+	time.Sleep(50 * time.Millisecond)
+	_ = drainOne(t, alice) // "subscribed" ack
+
+	// Now Bob subscribes — Alice should get a presence_change (online) for Bob.
+	hub.subscribeCh <- &subscription{client: bob, channelID: chID}
+	time.Sleep(50 * time.Millisecond)
+	_ = drainOne(t, bob) // "subscribed" ack
+
+	ev := drainOne(t, alice)
+	if ev.Type != "presence_change" {
+		t.Fatalf("expected presence_change, got %s", ev.Type)
+	}
+	if ev.UserID != bob.userID.String() {
+		t.Fatalf("expected user_id=%s, got %s", bob.userID, ev.UserID)
+	}
+	if ev.Status != "online" {
+		t.Fatalf("expected status=online, got %s", ev.Status)
+	}
+
+	// Bob should NOT receive his own presence event.
+	select {
+	case data := <-bob.send:
+		t.Fatalf("bob should not get his own presence event, got %s", string(data))
+	default:
+	}
+}
+
+func TestPresenceBroadcastOnDisconnect(t *testing.T) {
+	hub := startHub(t)
+	chID := uuid.New()
+
+	alice := fakeClient(hub, uuid.New())
+	bob := fakeClient(hub, uuid.New())
+
+	hub.register <- alice
+	hub.register <- bob
+	time.Sleep(50 * time.Millisecond)
+
+	hub.subscribeCh <- &subscription{client: alice, channelID: chID}
+	time.Sleep(50 * time.Millisecond)
+	_ = drainOne(t, alice) // "subscribed" ack
+
+	hub.subscribeCh <- &subscription{client: bob, channelID: chID}
+	time.Sleep(50 * time.Millisecond)
+	_ = drainOne(t, bob)   // "subscribed" ack
+	_ = drainOne(t, alice) // presence_change online for bob
+
+	// Bob disconnects — Alice should get presence_change (offline).
+	hub.unregister <- bob
+	time.Sleep(100 * time.Millisecond)
+
+	ev := drainOne(t, alice)
+	if ev.Type != "presence_change" {
+		t.Fatalf("expected presence_change, got %s", ev.Type)
+	}
+	if ev.Status != "offline" {
+		t.Fatalf("expected status=offline, got %s", ev.Status)
+	}
+	if ev.UserID != bob.userID.String() {
+		t.Fatalf("expected user_id=%s, got %s", bob.userID, ev.UserID)
+	}
+}

@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/lalith-99/echostream/internal/middleware"
 	"github.com/lalith-99/echostream/internal/models"
+	"github.com/lalith-99/echostream/internal/presence"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -962,4 +963,161 @@ func (c *capturingMembershipRepo) ListMembers(ctx context.Context, chID uuid.UUI
 
 func (c *capturingMembershipRepo) IsMember(ctx context.Context, chID, uID uuid.UUID) (bool, error) {
 	return c.MembershipRepoFull.IsMember(ctx, chID, uID)
+}
+
+// ==========================================================================
+// Presence handler tests
+// ==========================================================================
+
+type mockPresenceChecker struct {
+	statuses map[uuid.UUID]presence.Status
+}
+
+func (m *mockPresenceChecker) BulkStatus(_ context.Context, userIDs []uuid.UUID) map[uuid.UUID]presence.Status {
+	if m.statuses == nil {
+		return nil
+	}
+	result := make(map[uuid.UUID]presence.Status, len(userIDs))
+	for _, id := range userIDs {
+		if s, ok := m.statuses[id]; ok {
+			result[id] = s
+		}
+	}
+	return result
+}
+
+func presenceRouter(h *PresenceHandler, uid, tid uuid.UUID) *gin.Engine {
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set(middleware.ContextKeyUserID, uid)
+		c.Set(middleware.ContextKeyTenantID, tid)
+		c.Next()
+	})
+	r.GET("/v1/channels/:id/presence", h.GetChannelPresence)
+	return r
+}
+
+func TestPresence_ChannelNotFound(t *testing.T) {
+	chRepo := &mockChannelRepo{
+		getByIDFn: func(_ context.Context, _, _ uuid.UUID) (*models.Channel, error) {
+			return nil, nil
+		},
+	}
+	h := NewPresenceHandler(chRepo, &mockMembershipRepoFull{}, &mockPresenceChecker{}, zap.NewNop())
+	r := presenceRouter(h, uuid.New(), uuid.New())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/channels/"+uuid.New().String()+"/presence", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPresence_InvalidChannelID(t *testing.T) {
+	h := NewPresenceHandler(&mockChannelRepo{}, &mockMembershipRepoFull{}, &mockPresenceChecker{}, zap.NewNop())
+	r := presenceRouter(h, uuid.New(), uuid.New())
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/channels/not-a-uuid/presence", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPresence_Success(t *testing.T) {
+	tid := uuid.New()
+	chID := uuid.New()
+	uid1, uid2, uid3 := uuid.New(), uuid.New(), uuid.New()
+
+	chRepo := &mockChannelRepo{
+		getByIDFn: func(_ context.Context, _, _ uuid.UUID) (*models.Channel, error) {
+			return &models.Channel{ID: chID, TenantID: tid}, nil
+		},
+	}
+	memRepo := &mockMembershipRepoFull{
+		members: []models.ChannelMember{
+			{ChannelID: chID, UserID: uid1, Role: "admin"},
+			{ChannelID: chID, UserID: uid2, Role: "member"},
+			{ChannelID: chID, UserID: uid3, Role: "member"},
+		},
+	}
+	tracker := &mockPresenceChecker{
+		statuses: map[uuid.UUID]presence.Status{
+			uid1: presence.Online,
+			// uid2 is missing → should show "offline"
+			uid3: presence.Online,
+		},
+	}
+	h := NewPresenceHandler(chRepo, memRepo, tracker, zap.NewNop())
+	r := presenceRouter(h, uuid.New(), tid)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/channels/"+chID.String()+"/presence", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var result []memberPresence
+	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(result) != 3 {
+		t.Fatalf("expected 3 members, got %d", len(result))
+	}
+
+	// Build a lookup by user ID for assertion order independence.
+	byUser := make(map[uuid.UUID]memberPresence)
+	for _, mp := range result {
+		byUser[mp.UserID] = mp
+	}
+
+	if byUser[uid1].Status != presence.Online {
+		t.Fatalf("uid1 expected online, got %s", byUser[uid1].Status)
+	}
+	if byUser[uid2].Status != presence.Offline {
+		t.Fatalf("uid2 expected offline, got %s", byUser[uid2].Status)
+	}
+	if byUser[uid3].Status != presence.Online {
+		t.Fatalf("uid3 expected online, got %s", byUser[uid3].Status)
+	}
+	if byUser[uid1].Role != "admin" {
+		t.Fatalf("uid1 expected role admin, got %s", byUser[uid1].Role)
+	}
+}
+
+func TestPresence_EmptyChannel(t *testing.T) {
+	tid := uuid.New()
+	chID := uuid.New()
+
+	chRepo := &mockChannelRepo{
+		getByIDFn: func(_ context.Context, _, _ uuid.UUID) (*models.Channel, error) {
+			return &models.Channel{ID: chID, TenantID: tid}, nil
+		},
+	}
+	// No members
+	memRepo := &mockMembershipRepoFull{members: []models.ChannelMember{}}
+	h := NewPresenceHandler(chRepo, memRepo, &mockPresenceChecker{}, zap.NewNop())
+	r := presenceRouter(h, uuid.New(), tid)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/channels/"+chID.String()+"/presence", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var result []memberPresence
+	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(result) != 0 {
+		t.Fatalf("expected 0 members, got %d", len(result))
+	}
 }

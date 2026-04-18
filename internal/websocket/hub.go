@@ -156,6 +156,8 @@ func (h *Hub) Run() {
 			} else {
 				sub.client.Send(data)
 			}
+			// Notify other channel subscribers that this user is online
+			h.broadcastPresence(sub.channelID, sub.client.userID, "online")
 			h.logger.Debug("client subscribed to channel",
 				zap.String("user_id", sub.client.userID.String()),
 				zap.String("channel_id", sub.channelID.String()),
@@ -213,6 +215,18 @@ func (h *Hub) addToChannel(client *Client, channelID uuid.UUID) {
 func (h *Hub) removeFromChannel(client *Client, channelID uuid.UUID) {
 	if clients, ok := h.channels[channelID]; ok {
 		delete(clients, client)
+		// Notify remaining subscribers that this user went offline —
+		// but only if this is the user's last connection in the channel.
+		stillHere := false
+		for c := range clients {
+			if c.userID == client.userID {
+				stillHere = true
+				break
+			}
+		}
+		if !stillHere && len(clients) > 0 {
+			h.broadcastPresence(channelID, client.userID, "offline")
+		}
 		if len(clients) == 0 {
 			delete(h.channels, channelID)
 			if h.onChannelInactive != nil {
@@ -222,5 +236,30 @@ func (h *Hub) removeFromChannel(client *Client, channelID uuid.UUID) {
 	}
 	if channels, ok := h.clientChannels[client]; ok {
 		delete(channels, channelID)
+	}
+}
+
+// broadcastPresence sends a presence_change event to all subscribers of a
+// channel, excluding the user whose status changed.
+func (h *Hub) broadcastPresence(channelID, userID uuid.UUID, status string) {
+	clients, ok := h.channels[channelID]
+	if !ok {
+		return
+	}
+	event := OutboundEvent{
+		Type:      "presence_change",
+		ChannelID: channelID.String(),
+		UserID:    userID.String(),
+		Status:    status,
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		h.logger.Error("failed to marshal presence event", zap.Error(err))
+		return
+	}
+	for client := range clients {
+		if client.userID != userID {
+			client.Send(data)
+		}
 	}
 }
