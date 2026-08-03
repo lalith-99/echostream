@@ -1,0 +1,12 @@
+import type { ReactNode } from 'react';
+import { Navigate } from 'react-router-dom';
+import { useAuthStore } from '../store/authStore';
+
+// Guards routes that require a valid, non-expired session.
+export function ProtectedRoute({ children }: { children: ReactNode }) {
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated());
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />;
+  }
+  return <>{children}</>;
+}

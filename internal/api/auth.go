@@ -1,11 +1,14 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/lalith-99/echostream/internal/auth"
+	"github.com/lalith-99/echostream/internal/invite"
 	"github.com/lalith-99/echostream/internal/repository"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
@@ -15,6 +18,7 @@ import (
 type AuthHandler struct {
 	userRepo   repository.UserRepository
 	signupRepo repository.SignupRepository
+	inviteSvc  *invite.Service
 	jwtSecret  string
 	logger     *zap.Logger
 }
@@ -23,12 +27,14 @@ type AuthHandler struct {
 func NewAuthHandler(
 	userRepo repository.UserRepository,
 	signupRepo repository.SignupRepository,
+	inviteSvc *invite.Service,
 	jwtSecret string,
 	logger *zap.Logger,
 ) *AuthHandler {
 	return &AuthHandler{
 		userRepo:   userRepo,
 		signupRepo: signupRepo,
+		inviteSvc:  inviteSvc,
 		jwtSecret:  jwtSecret,
 		logger:     logger,
 	}
@@ -38,7 +44,9 @@ type signupRequest struct {
 	Email       string `json:"email" binding:"required,email"`
 	Password    string `json:"password" binding:"required,min=8"`
 	DisplayName string `json:"display_name" binding:"required"`
-	TenantName  string `json:"tenant_name" binding:"required"`
+	// TenantName is required when InviteToken is empty (creates a new workspace).
+	TenantName  string `json:"tenant_name"`
+	InviteToken string `json:"invite_token"`
 }
 
 type loginRequest struct {
@@ -79,15 +87,48 @@ func (h *AuthHandler) Signup(c *gin.Context) {
 		return
 	}
 
-	// Atomically create tenant + user — transaction is handled inside the repository.
-	tenant, user, err := h.signupRepo.CreateTenantAndUser(c.Request.Context(), req.TenantName, req.Email, req.DisplayName, string(hash))
-	if err != nil {
-		h.logger.Error("signup transaction failed", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "signup failed"})
-		return
+	var userID, tenantID uuid.UUID
+
+	if req.InviteToken != "" {
+		// Join an existing workspace via invite token.
+		tenantIDStr, err := h.inviteSvc.Resolve(c.Request.Context(), req.InviteToken)
+		if err != nil {
+			if errors.Is(err, invite.ErrNotFound) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invite link is invalid or expired"})
+				return
+			}
+			h.logger.Error("failed to resolve invite token", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "signup failed"})
+			return
+		}
+		parsedTenantID, err := uuid.Parse(tenantIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invite link is invalid or expired"})
+			return
+		}
+		user, err := h.userRepo.Create(c.Request.Context(), parsedTenantID, req.Email, req.DisplayName, string(hash))
+		if err != nil {
+			h.logger.Error("failed to create user via invite", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "signup failed"})
+			return
+		}
+		userID, tenantID = user.ID, user.TenantID
+	} else {
+		// Create a brand-new workspace + user atomically.
+		if req.TenantName == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_name is required when invite_token is not provided"})
+			return
+		}
+		tenant, user, err := h.signupRepo.CreateTenantAndUser(c.Request.Context(), req.TenantName, req.Email, req.DisplayName, string(hash))
+		if err != nil {
+			h.logger.Error("signup transaction failed", zap.Error(err))
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "signup failed"})
+			return
+		}
+		userID, tenantID = user.ID, tenant.ID
 	}
 
-	token, err := auth.GenerateToken(user.ID, tenant.ID, user.Email, h.jwtSecret, 24*time.Hour)
+	token, err := auth.GenerateToken(userID, tenantID, req.Email, h.jwtSecret, 24*time.Hour)
 	if err != nil {
 		h.logger.Error("failed to generate token", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "signup failed"})

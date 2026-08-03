@@ -39,3 +39,17 @@ func (h *UserHandler) GetMe(c *gin.Context) {
 
 	c.JSON(http.StatusOK, user)
 }
+
+// List handles GET /v1/users — returns all users in the caller's tenant.
+func (h *UserHandler) List(c *gin.Context) {
+	tenantID := middleware.GetTenantID(c)
+
+	users, err := h.repo.ListByTenant(c.Request.Context(), tenantID)
+	if err != nil {
+		h.logger.Error("failed to list users", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list users"})
+		return
+	}
+
+	c.JSON(http.StatusOK, users)
+}

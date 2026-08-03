@@ -90,3 +90,27 @@ func (s *UserStore) GetByEmail(ctx context.Context, email string) (*models.User,
 	}
 	return &u, nil
 }
+
+func (s *UserStore) ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]models.User, error) {
+	query := `
+		SELECT id, tenant_id, email, display_name, created_at
+		FROM users
+		WHERE tenant_id = $1
+		ORDER BY display_name`
+
+	rows, err := s.pool.Query(ctx, query, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list users: %w", err)
+	}
+	defer rows.Close()
+
+	users := make([]models.User, 0)
+	for rows.Next() {
+		var u models.User
+		if err := rows.Scan(&u.ID, &u.TenantID, &u.Email, &u.DisplayName, &u.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan user: %w", err)
+		}
+		users = append(users, u)
+	}
+	return users, rows.Err()
+}

@@ -63,15 +63,23 @@ func (s *ChannelStore) GetByID(ctx context.Context, tenantID uuid.UUID, channelI
 	return &ch, nil
 }
 
-func (s *ChannelStore) ListByTenant(ctx context.Context, tenantID uuid.UUID, limit, offset int) ([]models.Channel, error) {
+func (s *ChannelStore) ListByTenant(ctx context.Context, tenantID, userID uuid.UUID, limit, offset int) ([]models.Channel, error) {
+	// Public channels are visible to all; private channels only to members.
 	query := `
 		SELECT id, tenant_id, name, is_private, created_at
 		FROM channels
 		WHERE tenant_id = $1
+		  AND (
+				is_private = false
+				OR EXISTS (
+					SELECT 1 FROM channel_members
+					WHERE channel_id = channels.id AND user_id = $2
+				)
+		  )
 		ORDER BY created_at DESC
-		LIMIT $2 OFFSET $3`
+		LIMIT $3 OFFSET $4`
 
-	rows, err := s.pool.Query(ctx, query, tenantID, limit, offset)
+	rows, err := s.pool.Query(ctx, query, tenantID, userID, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list channels: %w", err)
 	}

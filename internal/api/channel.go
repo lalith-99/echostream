@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -52,21 +54,25 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 
 	c.JSON(http.StatusCreated, ch)
 
-	// Auto-add the creator as the first admin member.
-	// This runs after the response is sent (best-effort). If it fails, the
-	// creator can still join manually, but we log the error.
-	if err := h.membership.AddMember(c.Request.Context(), ch.ID, middleware.GetUserID(c), "admin"); err != nil {
-		h.logger.Error("failed to add creator as admin", zap.Error(err))
-	}
+	// Run in a goroutine with its own context so request cancellation
+	// (browser closing the connection) can't abort the membership insert.
+	go func(channelID, userID uuid.UUID) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := h.membership.AddMember(ctx, channelID, userID, "admin"); err != nil {
+			h.logger.Error("failed to add creator as admin", zap.Error(err))
+		}
+	}(ch.ID, middleware.GetUserID(c))
 }
 
 // List handles GET /v1/channels?limit=50&offset=0
 func (h *ChannelHandler) List(c *gin.Context) {
 	tenantID := middleware.GetTenantID(c)
+	userID := middleware.GetUserID(c)
 
 	limit, offset := parsePagination(c, 50, 100)
 
-	channels, err := h.repo.ListByTenant(c.Request.Context(), tenantID, limit, offset)
+	channels, err := h.repo.ListByTenant(c.Request.Context(), tenantID, userID, limit, offset)
 	if err != nil {
 		h.logger.Error("failed to list channels", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list channels"})

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -40,7 +41,7 @@ func (m *mockChannelRepo) GetByID(ctx context.Context, tenantID, channelID uuid.
 	return &models.Channel{ID: channelID, TenantID: tenantID, Name: "test"}, nil
 }
 
-func (m *mockChannelRepo) ListByTenant(ctx context.Context, tenantID uuid.UUID, limit, offset int) ([]models.Channel, error) {
+func (m *mockChannelRepo) ListByTenant(ctx context.Context, tenantID, userID uuid.UUID, limit, offset int) ([]models.Channel, error) {
 	if m.listFn != nil {
 		return m.listFn(ctx, tenantID, limit, offset)
 	}
@@ -456,6 +457,10 @@ func (m *mockUserRepo) GetByID(ctx context.Context, tenantID, userID uuid.UUID) 
 	return nil, nil
 }
 
+func (m *mockUserRepo) ListByTenant(_ context.Context, _ uuid.UUID) ([]models.User, error) {
+	return []models.User{}, nil
+}
+
 type mockSignupRepo struct {
 	tenant *models.Tenant
 	user   *models.User
@@ -487,6 +492,7 @@ func TestSignup_Success(t *testing.T) {
 			tenant: &models.Tenant{ID: tid, Name: "Acme"},
 			user:   &models.User{ID: uid, TenantID: tid, Email: "a@b.com", DisplayName: "Alice"},
 		},
+		nil,
 		testJWTSecret,
 		zap.NewNop(),
 	)
@@ -519,6 +525,7 @@ func TestSignup_DuplicateEmail(t *testing.T) {
 			},
 		},
 		&mockSignupRepo{},
+		nil,
 		testJWTSecret,
 		zap.NewNop(),
 	)
@@ -536,7 +543,7 @@ func TestSignup_DuplicateEmail(t *testing.T) {
 }
 
 func TestSignup_MissingFields(t *testing.T) {
-	h := NewAuthHandler(&mockUserRepo{}, &mockSignupRepo{}, testJWTSecret, zap.NewNop())
+	h := NewAuthHandler(&mockUserRepo{}, &mockSignupRepo{}, nil, testJWTSecret, zap.NewNop())
 	r := authRouter(h)
 
 	// missing tenant_name
@@ -552,7 +559,7 @@ func TestSignup_MissingFields(t *testing.T) {
 }
 
 func TestSignup_ShortPassword(t *testing.T) {
-	h := NewAuthHandler(&mockUserRepo{}, &mockSignupRepo{}, testJWTSecret, zap.NewNop())
+	h := NewAuthHandler(&mockUserRepo{}, &mockSignupRepo{}, nil, testJWTSecret, zap.NewNop())
 	r := authRouter(h)
 
 	w := httptest.NewRecorder()
@@ -570,6 +577,7 @@ func TestSignup_RepoError(t *testing.T) {
 	h := NewAuthHandler(
 		&mockUserRepo{},
 		&mockSignupRepo{err: errors.New("db down")},
+		nil,
 		testJWTSecret,
 		zap.NewNop(),
 	)
@@ -602,6 +610,7 @@ func TestLogin_Success(t *testing.T) {
 			},
 		},
 		&mockSignupRepo{},
+		nil,
 		testJWTSecret,
 		zap.NewNop(),
 	)
@@ -640,6 +649,7 @@ func TestLogin_WrongPassword(t *testing.T) {
 			},
 		},
 		&mockSignupRepo{},
+		nil,
 		testJWTSecret,
 		zap.NewNop(),
 	)
@@ -660,6 +670,7 @@ func TestLogin_UserNotFound(t *testing.T) {
 	h := NewAuthHandler(
 		&mockUserRepo{}, // GetByEmail returns nil
 		&mockSignupRepo{},
+		nil,
 		testJWTSecret,
 		zap.NewNop(),
 	)
@@ -677,7 +688,7 @@ func TestLogin_UserNotFound(t *testing.T) {
 }
 
 func TestLogin_MissingFields(t *testing.T) {
-	h := NewAuthHandler(&mockUserRepo{}, &mockSignupRepo{}, testJWTSecret, zap.NewNop())
+	h := NewAuthHandler(&mockUserRepo{}, &mockSignupRepo{}, nil, testJWTSecret, zap.NewNop())
 	r := authRouter(h)
 
 	w := httptest.NewRecorder()
@@ -928,6 +939,8 @@ func TestChannelCreate_AddsCreatorAsAdmin(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
 	}
+	// The AddMember call runs in a goroutine after the response is sent; give it time.
+	time.Sleep(100 * time.Millisecond)
 	if addedChannelID != createdCh.ID {
 		t.Fatalf("expected AddMember called with channel %s, got %s", createdCh.ID, addedChannelID)
 	}

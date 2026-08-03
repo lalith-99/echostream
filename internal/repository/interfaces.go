@@ -16,8 +16,8 @@ type ChannelRepository interface {
 	// GetByID returns a single channel. Returns nil, nil if not found.
 	GetByID(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID) (*models.Channel, error)
 
-	// ListByTenant returns channels for a tenant, newest first, with pagination.
-	ListByTenant(ctx context.Context, tenantID uuid.UUID, limit, offset int) ([]models.Channel, error)
+	// ListByTenant returns public channels + private channels where userID is a member.
+	ListByTenant(ctx context.Context, tenantID, userID uuid.UUID, limit, offset int) ([]models.Channel, error)
 }
 
 // MembershipRepository handles who belongs to which channel.
@@ -54,6 +54,9 @@ type UserRepository interface {
 
 	// GetByEmail returns a user by email. Returns nil, nil if not found.
 	GetByEmail(ctx context.Context, email string) (*models.User, error)
+
+	// ListByTenant returns all users in a tenant ordered by display name.
+	ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]models.User, error)
 }
 
 // TenantRepository handles tenant (workspace) data.

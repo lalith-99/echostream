@@ -13,6 +13,7 @@ import (
 	"github.com/lalith-99/echostream/internal/api"
 	"github.com/lalith-99/echostream/internal/config"
 	"github.com/lalith-99/echostream/internal/db"
+	"github.com/lalith-99/echostream/internal/invite"
 	"github.com/lalith-99/echostream/internal/middleware"
 	"github.com/lalith-99/echostream/internal/observ"
 	"github.com/lalith-99/echostream/internal/presence"
@@ -82,18 +83,21 @@ func run() error {
 
 	// Services (business logic layer)
 	messageSvc := service.NewMessageService(messageRepo, membershipRepo, rc, logger)
+	inviteSvc := invite.NewService(rc.RDB())
 
 	// Handlers (thin HTTP adapters)
 	channelHandler := api.NewChannelHandler(channelRepo, membershipRepo, logger)
 	membershipHandler := api.NewMembershipHandler(membershipRepo, channelRepo, logger)
 	messageHandler := api.NewMessageHandler(messageSvc, logger)
 	userHandler := api.NewUserHandler(userRepo, logger)
-	authHandler := api.NewAuthHandler(userRepo, signupRepo, cfg.JWTSecret, logger)
+	authHandler := api.NewAuthHandler(userRepo, signupRepo, inviteSvc, cfg.JWTSecret, logger)
 	wsHandler := api.NewWSHandler(hub, membershipRepo, cfg.JWTSecret, logger)
 	presenceHandler := api.NewPresenceHandler(channelRepo, membershipRepo, tracker, logger)
+	workspaceHandler := api.NewWorkspaceHandler(inviteSvc, cfg.FrontendBaseURL, logger)
 
 	srv := gin.New()
 	srv.Use(gin.Logger(), gin.Recovery())
+	srv.Use(middleware.CORS(cfg.CORSAllowedOrigins))
 
 	logger.Info("starting EchoStream",
 		zap.String("port", cfg.Port),
@@ -127,6 +131,9 @@ func run() error {
 	v1.GET("/channels/:id/presence", presenceHandler.GetChannelPresence)
 
 	v1.GET("/users/me", userHandler.GetMe)
+	v1.GET("/users", userHandler.List)
+
+	v1.POST("/workspace/invite", workspaceHandler.GenerateInvite)
 
 	// --- Graceful shutdown ---
 	//
