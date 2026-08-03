@@ -1,0 +1,36 @@
+# EchoStream backend on Fly.io
+# Deploy: fly launch (first time) OR fly deploy (subsequent)
+
+app = "echostream-api"
+primary_region = "ord"  # Chicago — change to your preferred region
+
+[build]
+  # Uses the Dockerfile in the repo root
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  ENV = "production"
+  LOG_LEVEL = "info"
+  # Set secrets via: fly secrets set JWT_SECRET=... DATABASE_URL=... REDIS_URL=... FRONTEND_BASE_URL=...
+  # CORS_ALLOWED_ORIGINS is set to your Vercel URL, e.g. https://echostream.vercel.app
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/v1/health"
+    timeout = "5s"
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

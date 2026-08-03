@@ -2,20 +2,19 @@
 
 # 💬 EchoStream
 
-**A multi-tenant, real-time chat backend in Go.**
+**A full-stack, multi-tenant, real-time chat application.**
 
-The API layer behind a Slack-style product — **tenants, channels, memberships, and durable messages**
-over REST, with **live delivery, presence, and typing indicators** over WebSockets, fanned out across
-horizontally-scaled instances by **Redis pub/sub**.
+Go backend + React frontend — tenants, channels, memberships, and durable messages
+over REST, with live delivery, presence, and typing indicators over WebSockets, fanned out across
+horizontally-scaled instances by Redis pub/sub.
 
+[![CI](https://github.com/lalith-99/echostream/actions/workflows/ci.yml/badge.svg)](https://github.com/lalith-99/echostream/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
-[![Gin](https://img.shields.io/badge/HTTP-Gin-008ECF?logo=go&logoColor=white)](https://github.com/gin-gonic/gin)
-[![WebSocket](https://img.shields.io/badge/Realtime-WebSocket-4353FF)](https://github.com/gorilla/websocket)
+[![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgx-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org)
 [![Redis](https://img.shields.io/badge/Redis-pub%2Fsub%20%2B%20presence-DC382D?logo=redis&logoColor=white)](https://redis.io)
-[![JWT](https://img.shields.io/badge/Auth-JWT-000000?logo=jsonwebtokens&logoColor=white)](https://jwt.io)
 
-[Quick Start](#-quick-start) · [Architecture](docs/ARCHITECTURE.md) · [API](#-api-surface) · [Design Decisions](docs/ARCHITECTURE.md#13-key-design-decisions--tradeoffs) · [Roadmap](docs/ARCHITECTURE.md#14-roadmap--what-to-build-next)
+[Quick Start](#-quick-start) · [Architecture](docs/ARCHITECTURE.md) · [API](#-api-surface) · [Frontend](web/README.md)
 
 </div>
 
@@ -85,6 +84,7 @@ graph LR
 | Auth | JWT (golang-jwt/v5), bcrypt password hashing |
 | Observability | Structured logging (zap) |
 | Packaging | Docker Compose (Postgres + Redis) |
+| **Frontend** | **React 19 + TypeScript (Vite), Tailwind CSS, TanStack Query, Zustand** |
 
 ---
 
