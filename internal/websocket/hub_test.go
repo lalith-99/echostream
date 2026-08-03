@@ -176,8 +176,11 @@ func TestTypingExcludesSender(t *testing.T) {
 	hub.subscribeCh <- &subscription{client: sender, channelID: chID}
 	hub.subscribeCh <- &subscription{client: receiver, channelID: chID}
 	time.Sleep(50 * time.Millisecond)
-	_ = drainOne(t, sender)   // ack
-	_ = drainOne(t, receiver) // ack
+	_ = drainOne(t, sender)   // subscribed ack
+	_ = drainOne(t, receiver) // subscribed ack
+	// When receiver subscribes, broadcastPresence fires and sends a presence_change
+	// to sender. Drain it so the typing check below starts with a clean slate.
+	_ = drainOne(t, sender) // presence_change: receiver came online
 
 	// Send typing event
 	hub.typingCh <- &typingEvent{channelID: chID, userID: sender.userID}
