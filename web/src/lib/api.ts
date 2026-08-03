@@ -1,5 +1,5 @@
 import { api } from './apiClient';
-import type { AuthResponse, Channel, Message, User } from './types';
+import type { AuthResponse, Channel, MemberPresence, Message, User } from './types';
 
 export interface InviteResponse {
   token: string;
@@ -32,6 +32,9 @@ export const echostream = {
   listUsers: () => api.get<User[]>('/v1/users'),
 
   generateInvite: () => api.post<InviteResponse>('/v1/workspace/invite'),
+
+  getChannelPresence: (channelId: string) =>
+    api.get<MemberPresence[]>(`/v1/channels/${channelId}/presence`),
 
   listChannels: (limit = 50, offset = 0) =>
     api.get<Channel[]>(`/v1/channels?limit=${limit}&offset=${offset}`),

@@ -24,6 +24,9 @@ export function ChatPage() {
     activeChannelRef.current = activeChannel;
   }, [activeChannel]);
 
+  // Listeners that MessagePane components register to receive WS events.
+  const wsListeners = useRef<Set<(ev: OutboundEvent) => void>>(new Set());
+
   // Incoming WS message → prepend to TanStack Query cache for that channel.
   // Server returns newest-first; MessagePane's `select` reverses for display.
   const handleWsEvent = useCallback(
@@ -34,9 +37,16 @@ export function ChatPage() {
           (prev) => [event.message!, ...(prev ?? [])],
         );
       }
+      wsListeners.current.forEach((h) => h(event));
     },
     [queryClient],
   );
+
+  // Stable subscribe function passed down to child components.
+  const onWsEvent = useCallback((handler: (ev: OutboundEvent) => void) => {
+    wsListeners.current.add(handler);
+    return () => wsListeners.current.delete(handler);
+  }, []);
 
   const { send, status: wsStatus } = useWebSocket(token, handleWsEvent);
 
@@ -78,7 +88,7 @@ export function ChatPage() {
         userEmail={meQuery.data?.email ?? ''}
         workspaceId={claims?.tenant_id ?? ''}
       />
-      <MessagePane channel={activeChannel} wsStatus={wsStatus} />
+      <MessagePane channel={activeChannel} wsStatus={wsStatus} send={send} onWsEvent={onWsEvent} />
     </div>
   );
 }

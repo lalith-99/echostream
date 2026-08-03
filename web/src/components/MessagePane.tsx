@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -9,9 +10,10 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Hash, Lock, MessageSquare, Send } from 'lucide-react';
 import { echostream } from '../lib/api';
 import { useAuthStore } from '../store/authStore';
-import type { Channel, Message } from '../lib/types';
-import type { WSStatus } from '../hooks/useWebSocket';
 import { clsx } from 'clsx';
+import { MembersPanel } from './MembersPanel';
+import type { Channel, InboundEvent, Message, OutboundEvent, User } from '../lib/types';
+import type { WSStatus } from '../hooks/useWebSocket';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -38,9 +40,18 @@ function WSIndicator({ status }: { status: WSStatus }) {
 
 // ─── Message bubble ──────────────────────────────────────────────────────────
 
-function MessageBubble({ msg, myId }: { msg: Message; myId: string }) {
+function MessageBubble({
+  msg,
+  myId,
+  usersById,
+}: {
+  msg: Message;
+  myId: string;
+  usersById: Map<string, User>;
+}) {
   const isMe = msg.sender_id === myId;
-  const sender = isMe ? 'You' : msg.sender_id.slice(0, 8) + '…';
+  const user = usersById.get(msg.sender_id);
+  const sender = isMe ? 'You' : (user?.display_name ?? msg.sender_id.slice(0, 8) + '…');
 
   return (
     <div className={clsx('flex flex-col gap-0.5 px-4 py-1', isMe && 'items-end')}>
@@ -63,14 +74,16 @@ function MessageBubble({ msg, myId }: { msg: Message; myId: string }) {
   );
 }
 
-// ─── Message input ───────────────────────────────────────────────────────────
+// ─── Message input ──────────────────────────────────────────────────────────
 
 function MessageInput({
   channel,
   onSend,
+  onTyping,
 }: {
   channel: Channel;
   onSend: (content: string) => Promise<void>;
+  onTyping: () => void;
 }) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
@@ -95,7 +108,10 @@ function MessageInput({
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       void submit();
+      return;
     }
+    // Notify the hub that this user is typing (best-effort, fire-and-forget).
+    onTyping();
   }
 
   function handleSubmit(e: FormEvent) {
@@ -147,15 +163,19 @@ function MessageInput({
 interface Props {
   channel: Channel | null;
   wsStatus: WSStatus;
+  send: (msg: InboundEvent) => void;
+  onWsEvent: (handler: (ev: OutboundEvent) => void) => () => void;
 }
 
 // Props for the inner pane where channel is guaranteed non-null.
 interface ActiveProps {
   channel: Channel;
   wsStatus: WSStatus;
+  send: (msg: InboundEvent) => void;
+  onWsEvent: (handler: (ev: OutboundEvent) => void) => () => void;
 }
 
-export function MessagePane({ channel, wsStatus }: Props) {
+export function MessagePane({ channel, wsStatus, send, onWsEvent }: Props) {
   if (!channel) {
     return (
       <main className="flex flex-1 items-center justify-center bg-slate-50 dark:bg-slate-950">
@@ -167,15 +187,59 @@ export function MessagePane({ channel, wsStatus }: Props) {
     );
   }
 
-  return <ActivePane channel={channel} wsStatus={wsStatus} />;
+  return <ActivePane channel={channel} wsStatus={wsStatus} send={send} onWsEvent={onWsEvent} />;
 }
 
 // Separated so hooks only run when a channel IS selected.
-function ActivePane({ channel, wsStatus }: ActiveProps) {
+function ActivePane({ channel, wsStatus, send, onWsEvent }: ActiveProps) {
   const queryClient = useQueryClient();
   const claims = useAuthStore((s) => s.claims);
+
+  const { data: users = [] } = useQuery({
+    queryKey: ['users'],
+    queryFn: echostream.listUsers,
+    staleTime: 5 * 60_000,
+  });
+  const usersById = new Map(users.map((u) => [u.id, u]));
   const bottomRef = useRef<HTMLDivElement>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  // user_ids currently typing in this channel (auto-cleared after 3s of silence).
+  const [typingUsers, setTypingUsers] = useState<Map<string, string>>(new Map());
+  const typingTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  // Subscribe to incoming WS events for this pane.
+  useEffect(() => {
+    const unsub = onWsEvent((ev) => {
+      if (ev.type === 'typing' && ev.user_id && ev.user_id !== claims?.user_id) {
+        const uid = ev.user_id;
+        const name = usersById.get(uid)?.display_name ?? uid.slice(0, 8);
+        setTypingUsers((prev) => new Map(prev).set(uid, name));
+        // Clear after 3s of no new typing signal from this user.
+        clearTimeout(typingTimers.current.get(uid));
+        typingTimers.current.set(
+          uid,
+          setTimeout(() => {
+            setTypingUsers((prev) => {
+              const next = new Map(prev);
+              next.delete(uid);
+              return next;
+            });
+          }, 3000),
+        );
+      }
+    });
+    return unsub;
+  }, [onWsEvent, claims?.user_id, usersById]);
+
+  // Debounced typing signal sender — fires at most once per second of keystrokes.
+  const typingTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleTyping = useCallback(() => {
+    if (typingTimeout.current) return;
+    send({ type: 'typing', channel_id: channel.id });
+    typingTimeout.current = setTimeout(() => {
+      typingTimeout.current = null;
+    }, 1000);
+  }, [send, channel.id]);
 
   // Fetch messages (server returns newest-first; select reverses for display).
   const { data: messages = [], isLoading, isError } = useQuery({
@@ -231,9 +295,15 @@ function ActivePane({ channel, wsStatus }: ActiveProps) {
             {channel.name}
           </span>
         </div>
-        <div className="flex items-center gap-1.5 text-xs text-slate-400">
+        <div className="flex items-center gap-2">
           <WSIndicator status={wsStatus} />
-          <span>{wsStatus}</span>
+          <span className="text-xs text-slate-400">{wsStatus}</span>
+          <MembersPanel
+            channelId={channel.id}
+            usersById={usersById}
+            myUserId={claims?.user_id ?? ''}
+            onWsEvent={onWsEvent}
+          />
         </div>
       </header>
 
@@ -265,12 +335,20 @@ function ActivePane({ channel, wsStatus }: ActiveProps) {
         )}
 
         {messages.map((msg) => (
-          <MessageBubble key={msg.id} msg={msg} myId={claims?.user_id ?? ''} />
+          <MessageBubble key={msg.id} msg={msg} myId={claims?.user_id ?? ''} usersById={usersById} />
         ))}
         <div ref={bottomRef} />
       </div>
 
-      <MessageInput channel={channel} onSend={handleSend} />
+      {/* Typing indicator strip */}
+      {typingUsers.size > 0 && (
+        <div className="px-4 pb-1 text-xs text-slate-400 italic">
+          {[...typingUsers.values()].join(', ')}
+          {typingUsers.size === 1 ? ' is' : ' are'} typing…
+        </div>
+      )}
+
+      <MessageInput channel={channel} onSend={handleSend} onTyping={handleTyping} />
     </main>
   );
 }
