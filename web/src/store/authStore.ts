@@ -34,10 +34,10 @@ interface AuthState {
 }
 
 function initialToken(): string | null {
-  const token = localStorage.getItem(TOKEN_KEY);
+  const token = sessionStorage.getItem(TOKEN_KEY);
   if (!token) return null;
   if (isExpired(decodeJwt(token))) {
-    localStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(TOKEN_KEY);
     return null;
   }
   return token;
@@ -49,11 +49,11 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   token: bootToken,
   claims: bootToken ? decodeJwt(bootToken) : null,
   setToken: (token) => {
-    localStorage.setItem(TOKEN_KEY, token);
+    sessionStorage.setItem(TOKEN_KEY, token);
     set({ token, claims: decodeJwt(token) });
   },
   logout: () => {
-    localStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(TOKEN_KEY);
     set({ token: null, claims: null });
   },
   isAuthenticated: () => {
@@ -64,5 +64,5 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
 // Read the raw token outside React (e.g. in the API client / WS connection).
 export function getToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
+  return sessionStorage.getItem(TOKEN_KEY);
 }
