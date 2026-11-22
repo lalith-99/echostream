@@ -30,3 +30,26 @@ docker compose -p echostream-bench down
 ```
 
 The final command retains the benchmark volume. To use existing local test processes instead, set `WRITER` and `READER` to their distinct loopback HTTP origins. `READERS` (2–30) and `MESSAGES` (1–30) control the workload. k6 exits unsuccessfully if subscriptions, accepted sends, or unique deliveries fall short or if response validation fails. The summary reports duplicates observed through completion and always includes missing deliveries.
+
+## Concurrent sends during reconnect
+
+In a [recorded CI run](https://github.com/lalith-99/echostream/actions/runs/45012421471), two disposable Compose API instances shared PostgreSQL and Redis on one GitHub-hosted runner. The Node client used loopback HTTP, sent to both instances and connected three WebSocket readers through the frontend proxy. In each of 24 rounds the writers submitted one message apiece concurrently, then paused for one second. One reader disconnected for eight rounds.
+
+| Measurement | Observed |
+|---|---|
+| Write window and final live drain | 24.2 s |
+| Distinct committed messages | 48 |
+| Distinct live IDs by reader | 48, 48, 32 |
+| Offline IDs recovered via paginated history | 16 |
+| Missing after final history comparison / duplicate live frames | 0 / 0 |
+| Send initiation to first live observation, 128 reader-message pairs | p50 6.2 ms · p95 9.5 ms · p99 11.3 ms |
+
+The elapsed time excludes signup, initial subscriptions and the final history scan. Latency uses one client clock. History requests used seven rows per page. The measurement covers paced traffic on a single runner. The receiver compares message IDs and bodies, since two concurrent HTTP requests may finish in either order.
+
+The two uninterrupted readers could pass the original test even if the third reader stopped receiving live frames after it reconnected. A final history scan could conceal that regression. The [current workload](../../scripts/reconnect-load.mjs) checks the returning reader's live stream against the IDs sent while it was connected, and separately checks the IDs committed during its absence.
+
+With the disposable Compose stack and peer running as above, run this command from the repository root using Node 22 or later.
+
+```bash
+node scripts/reconnect-load.mjs http://127.0.0.1:8082 http://127.0.0.1:5173
+```
