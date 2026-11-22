@@ -12,7 +12,6 @@ import (
 	"github.com/google/uuid"
 	gorillaws "github.com/gorilla/websocket"
 	"github.com/lalith-99/echostream/internal/auth"
-	"github.com/lalith-99/echostream/internal/repository"
 	"github.com/lalith-99/echostream/internal/websocket"
 	"go.uber.org/zap"
 )
@@ -23,9 +22,11 @@ const (
 	maxSocketsPerUser = 8
 )
 
+type socketMembershipCheck func(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (bool, error)
+
 type WSHandler struct {
 	hub            *websocket.Hub
-	membershipRepo repository.MembershipRepository
+	checkMembership socketMembershipCheck
 	jwtSecret      string
 	logger         *zap.Logger
 	upgrader       gorillaws.Upgrader
@@ -34,10 +35,10 @@ type WSHandler struct {
 	active         int
 }
 
-func NewWSHandler(hub *websocket.Hub, membershipRepo repository.MembershipRepository, jwtSecret string, logger *zap.Logger, allowedOrigins ...string) *WSHandler {
+func NewWSHandler(hub *websocket.Hub, checkMembership socketMembershipCheck, jwtSecret string, logger *zap.Logger, allowedOrigins ...string) *WSHandler {
 	return &WSHandler{
 		hub:            hub,
-		membershipRepo: membershipRepo,
+		checkMembership: checkMembership,
 		jwtSecret:      jwtSecret,
 		logger:         logger,
 		perUser:        make(map[uuid.UUID]int),
@@ -107,7 +108,7 @@ func (h *WSHandler) HandleWS(c *gin.Context) {
 		return
 	}
 	check := func(ctx context.Context, channel, user uuid.UUID) (bool, error) {
-		return h.membershipRepo.IsMember(ctx, claims.TenantID, channel, user)
+		return h.checkMembership(ctx, claims.TenantID, channel, user)
 	}
 	client := websocket.NewClient(h.hub, conn, claims.UserID, claims.ExpiresAt.Time, check, h.logger)
 	client.Serve()

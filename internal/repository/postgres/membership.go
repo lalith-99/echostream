@@ -11,12 +11,17 @@ import (
 )
 
 type MembershipStore struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	lookups chan struct{}
+	waiting chan membershipRequest
 }
 
 // NewMembershipStore creates a membership store backed by Postgres.
 func NewMembershipStore(pool *pgxpool.Pool) *MembershipStore {
-	return &MembershipStore{pool: pool}
+	return &MembershipStore{
+		pool: pool, lookups: make(chan struct{}, 4),
+		waiting: make(chan membershipRequest),
+	}
 }
 
 func (s *MembershipStore) AddMember(ctx context.Context, tenantID, channelID, actorID, targetID uuid.UUID) error {
