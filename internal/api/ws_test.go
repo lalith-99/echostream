@@ -32,7 +32,7 @@ func TestWebSocketSessionAuthorization(t *testing.T) {
 	t.Cleanup(hub.Shutdown)
 	repo := &wsMembership{}
 	repo.allowed.Store(true)
-	h := NewWSHandler(hub, repo, "test-secret", zap.NewNop(), "https://chat.example")
+	h := NewWSHandler(hub, repo.IsMember, "test-secret", zap.NewNop(), "https://chat.example")
 	engine := gin.New()
 	engine.GET("/v1/ws", h.HandleWS)
 	server := httptest.NewServer(engine)
@@ -112,7 +112,7 @@ func TestWebSocketExpiresWhileIdle(t *testing.T) {
 	go hub.Run()
 	defer hub.Shutdown()
 	engine := gin.New()
-	h := NewWSHandler(hub, &wsMembership{}, "test-secret", zap.NewNop())
+	h := NewWSHandler(hub, (&wsMembership{}).IsMember, "test-secret", zap.NewNop())
 	engine.GET("/v1/ws", h.HandleWS)
 	server := httptest.NewServer(engine)
 	defer server.Close()

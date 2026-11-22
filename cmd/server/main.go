@@ -107,7 +107,7 @@ func run() error {
 	messages := api.NewMessageHandler(service.NewMessageService(messageRepo), logger)
 	user := api.NewUserHandler(userRepo, logger)
 	auth := api.NewAuthHandler(userRepo, postgres.NewSignupStore(pool), inviteSvc, cfg.JWTSecret, logger)
-	ws := api.NewWSHandler(hub, membershipRepo, cfg.JWTSecret, logger, cfg.CORSAllowedOrigins...)
+	ws := api.NewWSHandler(hub, membershipRepo.CheckSocketMembership, cfg.JWTSecret, logger, cfg.CORSAllowedOrigins...)
 	pres := api.NewPresenceHandler(channelRepo, membershipRepo, tracker, logger)
 	workspace := api.NewWorkspaceHandler(inviteSvc, userRepo, cfg.FrontendBaseURL, logger)
 

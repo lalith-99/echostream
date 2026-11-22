@@ -110,6 +110,36 @@ func TestChannelWorkspaceAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	verifyVisible(outsider, false)
+	checkBatch := func(guestAllowed bool) {
+		t.Helper()
+		expected := map[membershipKey]bool{
+			{workspace, private.ID, owner}: true,
+			{workspace, private.ID, guest.ID}: guestAllowed,
+			{workspace, private.ID, outsider}: false,
+			{otherWorkspace, private.ID, owner}: false,
+		}
+		// Preload a full waiting channel to force one mixed-tenant batch
+		// deterministically. Production callers rendezvous on an unbuffered one.
+		batched := NewMembershipStore(pool)
+		batched.waiting = make(chan membershipRequest, len(expected))
+		peers := make(map[membershipKey]chan membershipResult, len(expected))
+		for key := range expected {
+			reply := make(chan membershipResult, 1)
+			peers[key] = reply
+			batched.waiting <- membershipRequest{key: key, reply: reply}
+		}
+		ok, err := batched.CheckSocketMembership(ctx, workspace, private.ID, owner)
+		if err != nil || !ok {
+			t.Fatalf("owner check: allowed=%t err=%v", ok, err)
+		}
+		for key, allowed := range expected {
+			result := <-peers[key]
+			if result.err != nil || result.allowed != allowed {
+				t.Fatalf("batched membership %+v: got %+v, want %t", key, result, allowed)
+			}
+		}
+	}
+	checkBatch(true)
 	allowed, err := members.IsMember(ctx, workspace, private.ID, outsider)
 	if err != nil || allowed {
 		t.Fatalf("membership must match both workspace identities: allowed=%v err=%v", allowed, err)
@@ -126,6 +156,7 @@ func TestChannelWorkspaceAccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	verifyVisible(guest.ID, false)
+	checkBatch(false)
 	roster, err = members.ListMembers(ctx, workspace, private.ID, guest.ID, 10, 0)
 	if err != nil || len(roster) != 0 {
 		t.Fatalf("private roster after leaving: roster=%v err=%v", roster, err)
