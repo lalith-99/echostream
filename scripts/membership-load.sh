@@ -4,7 +4,7 @@ set -euo pipefail
 root=$(git rev-parse --show-toplevel)
 base=1ed40e5995678a30e003593e61e993399085fb8a
 tmp=$(mktemp -d)
-export COMPOSE_PROJECT_NAME="echoauthbench${RANDOM}"
+export COMPOSE_PROJECT_NAME="echoauthbench-$(basename "$tmp" | tr -cd "a-z0-9")"
 cat > "$tmp/stats.yml" <<'YAML'
 services:
   postgres:
@@ -41,6 +41,7 @@ for variant in original batched; do
     WHERE query LIKE 'SELECT EXISTS (%FROM channel_members m%JOIN channels c%JOIN users u%'
        OR query LIKE 'SELECT k.tenant, k.channel, k.member%FROM unnest(%'" \
     | tee "$root/membership-$variant-calls.txt"
+  test "$(cat "$root/membership-$variant-calls.txt")" -gt 0
   cleanup_stack
   project_dir=
 done

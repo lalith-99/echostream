@@ -140,6 +140,56 @@ func TestChannelWorkspaceAccess(t *testing.T) {
 		}
 	}
 	checkBatch(true)
+	t.Run("canceled batch leader leaves peer lookup running", func(t *testing.T) {
+		cfg, err := pgxpool.ParseConfig(dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.MaxConns = 1
+		limited, err := pgxpool.NewWithConfig(ctx, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer limited.Close()
+		conn, err := limited.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Release()
+		batched := NewMembershipStore(limited)
+		batched.waiting = make(chan membershipRequest, 1)
+		peer := membershipRequest{membershipKey{workspace, private.ID, owner}, make(chan membershipResult, 1)}
+		batched.waiting <- peer
+		leader, cancel := context.WithCancel(ctx)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			_, err := batched.CheckSocketMembership(leader, workspace, private.ID, guest.ID)
+			done <- err
+		}()
+		// The batch started, but its only database connection is held above.
+		deadline := time.Now().Add(time.Second)
+		for len(batched.waiting) != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if len(batched.waiting) != 0 {
+			t.Fatal("batch did not take the peer")
+		}
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("leader cancellation: %v", err)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("leader waited for blocked database after cancellation")
+		}
+		conn.Release()
+		allowed, err := peer.wait(ctx)
+		if !allowed || err != nil {
+			t.Fatalf("current peer should still be authorized: allowed=%t err=%v", allowed, err)
+		}
+	})
 	allowed, err := members.IsMember(ctx, workspace, private.ID, outsider)
 	if err != nil || allowed {
 		t.Fatalf("membership must match both workspace identities: allowed=%v err=%v", allowed, err)

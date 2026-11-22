@@ -32,17 +32,8 @@ func (s *MembershipStore) CheckSocketMembership(ctx context.Context, tenant, cha
 	case <-ctx.Done():
 		return false, ctx.Err()
 	case s.waiting <- req:
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		case result := <-req.reply:
-			if err := ctx.Err(); err != nil {
-				return false, err
-			}
-			return result.allowed, result.err
-		}
+		return req.wait(ctx)
 	case s.lookups <- struct{}{}:
-		defer func() { <-s.lookups }()
 	}
 
 	// Collect only callers that are already waiting. A single reader incurs
@@ -58,25 +49,40 @@ collect:
 		}
 	}
 	if len(peers) == 0 {
+		defer func() { <-s.lookups }()
 		return s.IsMember(ctx, tenant, channel, user)
 	}
 
-	keys := map[membershipKey]bool{key: false}
-	for _, peer := range peers {
-		keys[peer.key] = false
-	}
-	// A disconnected reader cannot cancel the other sockets' permission
-	// checks. Buffer replies so returning them never waits on a gone socket.
-	queryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-	err := s.checkMembers(queryCtx, keys)
-	cancel()
-	for _, peer := range peers {
-		peer.reply <- membershipResult{allowed: err == nil && keys[peer.key], err: err}
-	}
-	if ctx.Err() != nil {
+	// The shared lookup owns the slot until completion. Every caller can
+	// return on its own deadline without aborting another socket's request.
+	go s.resolveMemberships(context.WithoutCancel(ctx), append(peers, req))
+	return req.wait(ctx)
+}
+
+func (r membershipRequest) wait(ctx context.Context) (bool, error) {
+	select {
+	case <-ctx.Done():
 		return false, ctx.Err()
+	case result := <-r.reply:
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		return result.allowed, result.err
 	}
-	return err == nil && keys[key], err
+}
+
+func (s *MembershipStore) resolveMemberships(ctx context.Context, requests []membershipRequest) {
+	defer func() { <-s.lookups }()
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	keys := make(map[membershipKey]bool, len(requests))
+	for _, req := range requests {
+		keys[req.key] = false
+	}
+	err := s.checkMembers(ctx, keys)
+	for _, req := range requests {
+		req.reply <- membershipResult{allowed: err == nil && keys[req.key], err: err}
+	}
 }
 
 func (s *MembershipStore) checkMembers(ctx context.Context, keys map[membershipKey]bool) error {
