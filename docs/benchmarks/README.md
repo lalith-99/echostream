@@ -1,5 +1,7 @@
 # Cross-instance channel fan-out
 
+For the larger workload, see the [256-connection fan-out trials](fanout-load.md), with 516,096 verified reader/message pairs over three trials and per-trial latency distributions.
+
 In the recorded run, 20 different accounts held 20 simultaneous WebSocket connections to API B. Once every reader acknowledged its subscription to the same channel, k6 sent ten messages to API A, one every 100 ms. Every accepted message reached all 20 readers.
 
 | Measurement | Recorded value |

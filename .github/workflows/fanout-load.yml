@@ -1,0 +1,43 @@
+name: WebSocket fan-out load
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/fanout-load.mjs
+      - .github/workflows/fanout-load.yml
+permissions:
+  contents: read
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Start disposable gateways and stores
+        run: |
+          docker compose up -d --build --wait api
+          docker compose run -d --no-deps --name fanout-peer -p 127.0.0.1:8082:8081 api
+          curl --fail --retry 15 --retry-all-errors --retry-delay 1 http://127.0.0.1:8082/v1/ready
+          docker compose exec -T postgres postgres --version
+          docker compose exec -T redis redis-server --version
+      - name: Measure three fan-out trials
+        env:
+          RESULT: fanout-load.json
+          BENCH_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: node scripts/fanout-load.mjs http://127.0.0.1:8081 http://127.0.0.1:8082
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fanout-load
+          path: fanout-load.json
+      - name: Show recent logs on failure
+        if: failure()
+        run: docker compose logs --tail 80 api
+      - name: Remove disposable stack
+        if: always()
+        run: |
+          docker rm -f fanout-peer || true
+          docker compose down --volumes
