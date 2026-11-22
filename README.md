@@ -1,12 +1,12 @@
 <div align="center">
 
-# 💬 EchoStream
+# EchoStream
 
-**A full-stack, multi-tenant, real-time chat application.**
+**A Go and React chat application with PostgreSQL message history and Redis pub/sub.**
 
-Go backend + React frontend — tenants, channels, memberships, and durable messages
-over REST, with live delivery, presence, and typing indicators over WebSockets, fanned out across
-horizontally-scaled instances by Redis pub/sub.
+REST APIs handle workspaces, channels, memberships, and messages. WebSockets deliver live
+updates; Redis pub/sub carries message events between server instances. This is a personal
+development project. Capacity and production readiness have not been established.
 
 [![CI](https://github.com/lalith-99/echostream/actions/workflows/ci.yml/badge.svg)](https://github.com/lalith-99/echostream/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
@@ -14,7 +14,7 @@ horizontally-scaled instances by Redis pub/sub.
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgx-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org)
 [![Redis](https://img.shields.io/badge/Redis-pub%2Fsub%20%2B%20presence-DC382D?logo=redis&logoColor=white)](https://redis.io)
 
-[Quick Start](#-quick-start) · [Architecture](docs/ARCHITECTURE.md) · [API](#-api-surface) · [Frontend](web/README.md)
+[Quick Start](#quick-start) · [Architecture](docs/ARCHITECTURE.md) · [API](#api-surface) · [Frontend](web/README.md)
 
 </div>
 
@@ -22,14 +22,14 @@ horizontally-scaled instances by Redis pub/sub.
 
 ## What is EchoStream?
 
-EchoStream solves one problem well: **accept, durably persist, and deliver chat messages in real time
-for thousands of independent tenants — while scaling horizontally with no single-instance bottleneck.**
+EchoStream separates stored message history from live delivery. A send writes to PostgreSQL,
+attempts to publish a live update through Redis, and then returns the saved message to the caller.
 
 Every message is written to PostgreSQL *before* the sender is acknowledged — the database is the
 single source of truth. Real-time delivery is a best-effort layer on top: a new message is
 `PUBLISH`ed to Redis and fanned out to every server instance that holds a WebSocket subscriber for
-that channel. Any instance can accept a write; every instance can deliver it. No sticky sessions
-required for correctness.
+that channel. This supports message fan-out between instances, but Redis pub/sub does not replay
+missed events. Clients must fetch history to recover gaps.
 
 ```mermaid
 graph LR
@@ -39,7 +39,7 @@ graph LR
     subgraph srv["EchoStream Server"]
         api["HTTP + WS<br/>(Gin)"] -->|INSERT / SELECT| db
         api -->|PUBLISH ch:id| redis
-        hub["Hub<br/>(lock-free loop)"]
+        hub["Hub<br/>(single-owner event loop)"]
         bridge["Redis PubSub bridge"] --> hub
     end
 
@@ -49,30 +49,28 @@ graph LR
     hub --> web
 ```
 
-> 📐 **For system-design depth — C4 diagrams, sequence flows, the lock-free Hub state machine,
-> scaling math, failure modes, and tradeoff tables — read the
-> [Architecture Deep Dive](docs/ARCHITECTURE.md).**
+The [architecture notes](docs/ARCHITECTURE.md) explain the write path, Hub event loop,
+message fan-out, and current limitations.
 
 ---
 
-## ✨ Features
+## Implemented behavior
 
 | Capability | Detail |
 |---|---|
-| **Multi-tenancy** | Every entity is tenant-scoped. JWT carries `(user_id, tenant_id, email)`; every query filters by `tenant_id`. |
+| **Workspaces** | JWT carries `(user_id, tenant_id, email)`. Channel and message-history reads use tenant IDs; membership lookups use channel/user IDs. See the authorization limitation below. |
 | **Durable messages** | Persisted to Postgres before the sender is acknowledged. The DB is the source of truth; real-time is additive. |
-| **Real-time delivery** | WebSocket connections held by a lock-free **Hub**; new messages fanned out over **Redis pub/sub** across all instances. |
-| **Horizontal scaling** | A write on any instance reaches subscribers on every instance — no sticky sessions needed for delivery correctness. |
-| **Presence** | Redis-backed online/offline with a keepalive heartbeat; a user goes offline only when their **last** connection drops (multi-device safe). |
-| **Typing indicators** | Ephemeral, un-persisted `typing` events fanned out to a channel's other subscribers. |
-| **Channels & memberships** | Public/private channels, join/leave/invite, membership checks enforced in the service layer. |
+| **Real-time delivery** | A Hub goroutine owns local WebSocket state; Redis pub/sub forwards message events to subscribed instances on a best-effort basis. |
+| **Presence** | Redis stores a 90-second presence key, refreshed every 30 seconds. Connection counts are local to each server instance. |
+| **Typing indicators** | Ephemeral `typing` events reach the channel's other subscribers on the same server instance. |
+| **Channels & memberships** | Public/private channel flags and join/leave/invite APIs. Sending a message and subscribing over WebSocket check membership. |
 | **Cursor pagination** | `bigserial` message IDs give cheap total ordering and `before`-cursor history fetches. |
 | **Rate limiting** | Per-user fixed-window counter in Redis (60 req/min); **fails open** on Redis outage. |
 | **Graceful shutdown** | SIGINT/SIGTERM drains in-flight requests, then tears down pubsub → hub → redis → postgres → logger. |
 
 ---
 
-## 🏗️ Tech Stack
+## Tech stack
 
 | Layer | Technology |
 |---|---|
@@ -88,18 +86,23 @@ graph LR
 
 ---
 
-## 🚀 Quick Start
+## Quick start
 
 ### Prerequisites
 
 - Go 1.25+
-- Docker & Docker Compose
+- Docker with the Compose v2 plugin (`docker compose`) and support for `up --wait`
+- Make, or use `go run ./cmd/server` directly
+- Node.js 22 and npm for frontend development; Docker can build the optional frontend instead
 
 ### Run locally
 
 ```bash
+git clone https://github.com/lalith-99/echostream.git
+cd echostream
+
 # 1. Start dependencies (Postgres + Redis). Migrations auto-apply on first start.
-docker compose up -d
+docker compose up -d --wait postgres redis
 
 # 2. Run the server (defaults to :8081)
 make run          # or: go run ./cmd/server
@@ -107,6 +110,34 @@ make run          # or: go run ./cmd/server
 
 Config is read from environment variables with sensible local-dev defaults — see
 [`internal/config/config.go`](internal/config/config.go).
+
+Keep the backend running. From the repository root in a second terminal:
+
+```bash
+cd web
+npm ci
+npm run dev
+```
+
+Open `http://localhost:5173`, create an account, then create a channel. Use a workspace invite
+to add a second account to the same workspace; a separate signup without an invite creates a
+different workspace. The backend listens on `http://localhost:8081`.
+
+Alternatively, from the repository root, build and serve the frontend in Docker:
+
+```bash
+docker compose --profile full up -d --build --wait
+```
+
+This profile starts the frontend and its PostgreSQL/Redis dependencies. **The Go backend still
+runs separately with `make run`.** The frontend remains at `http://localhost:5173`, matching the
+backend's default CORS allowlist and invite URLs. Do not run the Vite dev server and containerized
+frontend on port 5173 at the same time.
+
+Compose publishes PostgreSQL, Redis, and the optional frontend on loopback only. The Go server
+itself listens on all interfaces; use the local defaults only for development. `docker compose down`
+stops the containers and retains the database volume. Initialization scripts run only on a new
+database volume; they do not upgrade an existing database.
 
 ### Build & test
 
@@ -132,7 +163,7 @@ curl -X POST http://localhost:8081/v1/auth/login \
 # → { "token": "<JWT>" }
 
 # Use the token for authenticated routes
-TOKEN=<JWT>
+TOKEN='paste-the-token-from-login-here'
 curl -X POST http://localhost:8081/v1/channels \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"name":"general","is_private":false}'
@@ -144,7 +175,23 @@ frames arrive.
 
 ---
 
-## ⚙️ Configuration
+## Current limitations
+
+- **Live delivery is best-effort.** A saved message can miss its Redis publish or a WebSocket
+  delivery. There is no transactional outbox, delivery acknowledgment, or automatic replay cursor.
+- **Presence is not coordinated across instances.** Closing the last local connection deletes
+  a shared Redis presence key even if another instance still holds a connection for that user.
+  Typing and `presence_change` events stay within the local Hub.
+- **Private-channel reads need further authorization work.** Message history filters by tenant
+  and channel but does not check membership. The private flag is not a complete read-access boundary.
+- **Channel creation and creator membership are separate writes.** The API returns before its
+  background membership insert completes, so an immediate send or subscribe can be rejected.
+- **Deployment hardening is unfinished.** The WebSocket upgrade currently accepts all origins,
+  the local JWT secret is a development default, and no load-test capacity is claimed.
+
+These limits are documented so the implementation can be evaluated as it stands.
+
+## Configuration
 
 All configuration is via environment variables (sensible defaults for local dev).
 
@@ -161,7 +208,7 @@ All configuration is via environment variables (sensible defaults for local dev)
 
 ---
 
-## 🔌 API Surface
+## API surface
 
 **Public** (no auth):
 
@@ -170,7 +217,7 @@ All configuration is via environment variables (sensible defaults for local dev)
 | `GET` | `/v1/health` | Liveness check. |
 | `POST` | `/v1/auth/signup` | Create tenant + account. |
 | `POST` | `/v1/auth/login` | Exchange credentials for a JWT. |
-| `GET` | `/v1/ws` | WebSocket upgrade (JWT-authenticated). |
+| `GET` | `/v1/ws` | WebSocket upgrade; separately validates a JWT in the `token` query parameter. |
 
 **Authenticated** (JWT required, rate-limited 60 req/min/user):
 
@@ -202,7 +249,7 @@ All configuration is via environment variables (sensible defaults for local dev)
 
 ---
 
-## 🗂️ Project Structure
+## Project structure
 
 ```
 echostream/
@@ -211,7 +258,7 @@ echostream/
 │   ├── api/              # HTTP + WebSocket handlers (thin adapters)
 │   ├── service/          # Business rules (MessageService: membership + limits + publish)
 │   ├── repository/       # Data access — interfaces.go + postgres/ implementations
-│   ├── websocket/        # Lock-free Hub, per-connection Client, wire protocol
+│   ├── websocket/        # Hub event loop, per-connection Client, wire protocol
 │   ├── redis/            # Redis client + pub/sub bridge to the Hub
 │   ├── presence/         # Online/offline tracker (Redis + keepalive)
 │   ├── middleware/       # JWT auth + Redis rate limiter
@@ -228,20 +275,24 @@ echostream/
 
 ---
 
-## 🧠 Architectural Constraints
+## Design choices
 
 1. **Never put business logic in handlers** — handlers parse/validate input, call services, format output.
 2. **Services coordinate repositories** — e.g. `MessageService.Send()` checks membership before persisting.
-3. **WebSocket state lives in the Hub only** — all mutations flow through its channels; no external state mutation, no locks.
-4. **Redis is best-effort** — the rate limiter fails open, and message fan-out logs-and-continues on publish failure. Messages are never lost because the DB is the source of truth.
-5. **Tenant isolation at the query level** — every query includes a `tenant_id` filter.
+3. **The Hub owns its state** — map mutations flow through one goroutine. Channel sends and Redis callbacks can still block; this is not a nonblocking algorithm.
+4. **PostgreSQL and live delivery are separate** — the rate limiter fails open, and message fan-out logs-and-continues on publish failure. Saved history remains available through the REST API.
+5. **Authorization needs checks at each boundary** — tenant filters and membership checks serve different purposes; the current private-history gap is listed above.
 
 ---
 
-## 📚 Documentation
+## Verification and documentation
 
-- **[Architecture Deep Dive](docs/ARCHITECTURE.md)** — C4 diagrams, the send-message lifecycle,
-  Redis fan-out, the lock-free Hub, presence, scaling, failure modes, tradeoffs, and the build-out roadmap.
+GitHub Actions builds, vets, and tests the Go backend; installs, lints, and builds the frontend;
+validates both Compose profiles; and checks that a fresh PostgreSQL volume receives the schema
+migrations. These checks do not establish multi-instance delivery behavior or load capacity.
+
+- **[Architecture notes](docs/ARCHITECTURE.md)** — diagrams, the send-message lifecycle,
+  Redis fan-out, the Hub, presence, failure modes, and planned work.
 
 ---
 
