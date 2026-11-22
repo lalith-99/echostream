@@ -6,5 +6,6 @@ set -e
 
 for f in /migrations/*.up.sql; do
   echo "Running migration: $f"
-  psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f "$f"
+  psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f "$f"
 done
+

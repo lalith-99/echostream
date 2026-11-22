@@ -26,9 +26,11 @@ React + TypeScript frontend for the [EchoStream](../README.md) real-time chat ba
 
 ## Getting started
 
+Use Node.js 22 and npm. Run these commands from the `web` directory:
+
 ```bash
 # 1. Install dependencies
-npm install
+npm ci
 
 # 2. Configure API endpoints (defaults point to the local backend on :8081)
 cp .env.example .env
@@ -40,8 +42,24 @@ npm run dev
 The backend must be running at `VITE_API_BASE_URL` (default `http://localhost:8081`). Start it from the repo root:
 
 ```bash
-docker compose up -d && make run
+docker compose up -d --wait postgres redis
+make run
 ```
+
+For a containerized frontend instead of Vite, run this from the repository root:
+
+```bash
+docker compose --profile full up -d --build --wait
+```
+
+Open `http://localhost:5173`. The Go backend must still run separately with `make run`; this
+Compose profile starts the frontend and database/cache dependencies, not the backend. The
+frontend port matches the backend's default CORS allowlist and workspace invite URL. Stop the
+Vite server before starting this profile because both use port 5173.
+
+Create a workspace invite to add another account to an existing workspace. A new signup without
+an invite creates a separate workspace. See the root README's [current limitations](../README.md#current-limitations)
+for the private-channel authorization and multi-instance presence gaps.
 
 ## Scripts
 
@@ -75,3 +93,4 @@ src/
 ## Architecture
 
 See [../README.md](../README.md) and [../docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) for the full system design, including the real-time fan-out path (REST → Postgres → Redis pub/sub → WebSocket hub → browser).
+

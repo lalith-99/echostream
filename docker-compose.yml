@@ -2,18 +2,18 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 1m30s
-      timeout: 30s
+      interval: 5s
+      timeout: 3s
       retries: 5
-      start_period: 30s
+      start_period: 5s
 
   postgres:
     image: postgres:15-alpine
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
       - POSTGRES_USER=${DB_USER:-echostream}
       - POSTGRES_PASSWORD=${DB_PASSWORD:-echostream123}
@@ -23,26 +23,25 @@ services:
       - ./migrations:/migrations
       - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U echostream"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 5s
       retries: 5
 
-volumes:
-  postgres_data:
-
-  # Optional: full-stack local dev (backend + frontend together)
-  # Run: docker compose --profile full up -d
+  # Optional containerized frontend. Run the Go backend on the host with make run.
+  # Run: docker compose --profile full up -d --build --wait
   web:
     profiles: [full]
     build:
       context: ./web
       dockerfile: Dockerfile
-      args:
-        - VITE_API_BASE_URL=http://localhost:8081
-        - VITE_WS_BASE_URL=ws://localhost:8081
     ports:
-      - "5174:80"
+      - "127.0.0.1:5173:80"
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

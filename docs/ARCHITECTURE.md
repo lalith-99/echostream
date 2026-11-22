@@ -2,13 +2,12 @@
 
 > A multi-tenant, real-time **chat backend** written in Go — the API layer behind a Slack-style
 > product. Tenants, users, channels, memberships, and messages are persisted in PostgreSQL; live
-> delivery, presence, and typing indicators are fanned out over **WebSockets**, coordinated across
-> horizontally-scaled instances by **Redis pub/sub**.
+> message delivery uses **WebSockets** and **Redis pub/sub**. Typing and presence-change events
+> currently stay within each server's local Hub.
 
-This document is the canonical system-design reference. It is written as an **onboarding and design
-guide** — every major decision includes the *why* and the *tradeoff*, not just the *what*. If you are
-here to understand how to grow this into a full SDE2 portfolio project, jump to
-[§14 Roadmap](#14-roadmap--what-to-build-next).
+These notes describe the current implementation and its limits. The [roadmap](#14-roadmap--what-to-build-next)
+contains proposed work; those items are not implemented capabilities. This development project
+has no published load-test capacity or production-readiness claim.
 
 ---
 
@@ -34,16 +33,16 @@ here to understand how to grow this into a full SDE2 portfolio project, jump to
 
 ## 1. System at a Glance
 
-EchoStream solves one problem well: **"accept, persist, and deliver chat messages in real time for
-thousands of independent tenants, while scaling horizontally without a single-instance bottleneck."**
+EchoStream accepts chat messages over REST, stores them in PostgreSQL, and attempts live delivery
+through Redis pub/sub and WebSockets. Persisted history and live delivery have separate failure modes.
 
 | Concern | How EchoStream handles it |
 |---|---|
 | **Durability** | Every message is written to PostgreSQL *before* the sender is acknowledged. The DB is the single source of truth; real-time delivery is a best-effort layer on top. |
-| **Tenant isolation** | Every entity carries a `tenant_id`; JWT claims carry `(user_id, tenant_id, email)`; every query is tenant-scoped. |
-| **Real-time delivery** | WebSocket connections are held by a lock-free **Hub**. New messages are `PUBLISH`ed to Redis and fanned out to all instances that hold subscribers for that channel. |
-| **Horizontal scaling** | Redis pub/sub decouples message producers from the WebSocket connections. A message sent to an instance in `us-east-1a` reaches a subscriber connected to an instance in `us-east-1b`. No sticky sessions required for delivery correctness. |
-| **Presence** | Redis keys (`presence:<userID>`) with a keepalive heartbeat; a user goes offline only when their **last** connection drops. |
+| **Tenant context** | JWT claims carry `(user_id, tenant_id, email)`. Channel and message-history reads filter by tenant; membership lookups use channel/user IDs. Private-channel history lacks a membership check. |
+| **Real-time delivery** | A single Hub goroutine owns local connection state. Redis forwards message events to subscribed instances on a best-effort basis. |
+| **Multiple instances** | Redis decouples message producers from local WebSocket connections. This message path can cross instances; typing and presence-change events currently cannot. |
+| **Presence** | Redis keys (`presence:<userID>`) expire after 90 seconds and refresh every 30 seconds. The Hub's connection count is per instance, so disconnect handling is not globally coordinated. |
 | **Fair usage** | Per-user fixed-window rate limiting in Redis; fails open on Redis outage. |
 | **Ordering & pagination** | Messages use a monotonic `bigserial` ID for cheap ordering and cursor pagination. |
 | **Graceful shutdown** | SIGINT/SIGTERM drains in-flight HTTP requests, then tears down pubsub → hub → redis → postgres → logger in order. |
@@ -101,7 +100,7 @@ graph TB
     subgraph Server["EchoStream Server (single Go binary)"]
         http["HTTP Server :8081<br/>Gin router + middleware"]
         ws["WebSocket Endpoint<br/>/v1/ws"]
-        hub["Hub<br/>(lock-free event loop goroutine)"]
+        hub["Hub<br/>(single-owner event loop)"]
         bridge["Redis PubSub Bridge<br/>(Listen goroutine)"]
     end
 
@@ -307,8 +306,8 @@ sequenceDiagram
 **The critical ordering guarantee:** persist **then** publish. The database write is the commit
 point. If the Redis `PUBLISH` fails, the message is still saved and the sender still gets a `201`;
 the failure is logged, and the message will appear on the next history fetch (`GET .../messages`).
-We never acknowledge a message we haven't durably stored, and we never lose a message because the
-real-time layer hiccupped.
+A Redis publish failure does not roll back the saved row. It can still leave a gap in live delivery,
+which the client must recover through history reads.
 
 ---
 
@@ -358,8 +357,8 @@ actual live interest, not the global channel count.
 
 ## 8. The Hub Event Loop
 
-The `Hub` (`internal/websocket/hub.go`) is the heart of the real-time layer and a deliberate exercise
-in **lock-free concurrency**. All mutable state — which clients are in which channels, connection
+The `Hub` (`internal/websocket/hub.go`) uses a **single-owner event loop**. Its mutable state —
+which clients are in which channels, connection
 counts per user, keepalive cancels — is owned by a **single goroutine** (`Hub.Run()`). Every mutation
 arrives as a message on a channel; nothing is touched from the outside.
 
@@ -390,9 +389,9 @@ for {
 }
 ```
 
-Because only `Run()` reads or writes the maps, there is no data race and no lock contention — the
-event loop is the serialization point. Producers (HTTP handlers, the Redis listener, per-connection
-read pumps) simply send on the appropriate channel and move on.
+`Run()` serializes map mutations. This avoids placing a mutex around each map operation, but
+it is not a nonblocking algorithm: sends on the event channels can wait, and Redis subscription
+and presence callbacks run in the Hub goroutine. A slow callback can delay other events.
 
 **Per-connection plumbing** (`internal/websocket/client.go`): each `Client` has a buffered `send`
 channel and a write pump goroutine. `Client.Send(data)` is a non-blocking enqueue — if a slow client
@@ -421,21 +420,22 @@ sequenceDiagram
     end
     C->>H: disconnect (unregister)
     H->>H: userConns[user]--
-    alt last connection for user
+    alt last connection for user on this instance
         H->>P: SetOffline(user)
-        P->>R: SET presence:<user> "offline"
+        P->>R: DEL presence:<user>
     end
 ```
 
-The key invariant: **a user is online if they have ≥1 live connection.** The hub tracks
-`userConns map[uuid.UUID]int`; presence only flips to offline when that count hits zero. This
-correctly handles the multi-device / multi-tab case — closing one tab does not mark you offline while
-another is still open.
+The Hub tracks `userConns map[uuid.UUID]int` within one process. Closing one of several local
+connections leaves the presence key intact. However, closing the last local connection deletes
+the shared Redis key even if another instance still has that user's connection. Its keepalive
+uses `EXPIRE`, which does not recreate a deleted key. Cross-instance presence therefore needs a
+different representation, such as per-connection leases, before it can be treated as accurate.
 
 **Typing indicators** are intentionally *ephemeral and un-persisted*. A `typing` frame is fanned out
-to the channel's other subscribers and never touches Postgres — typing is a transient UI hint, not
-domain data. It is broadcast to `client.userID != sender`, so you never see your own typing echoed
-back.
+to the channel's other subscribers **on the same instance** and never touches Postgres or Redis
+pub/sub. Presence-change events are also local. Clients connected to another instance do not
+receive these events through the current implementation.
 
 ---
 
@@ -447,8 +447,11 @@ back.
   verifies the signature and injects claims into the Gin context.
 - Handlers read identity via `middleware.GetUserID(c)` / `GetTenantID(c)` / `GetEmail(c)` — they
   never trust client-supplied tenant/user IDs from the body.
-- Every repository method takes `tenantID` for query scoping, so tenant isolation is enforced at the
-  data-access layer even where foreign keys already imply it.
+- Channel and message-history queries use `tenantID`; membership methods use channel/user IDs.
+  These are different checks, and not every repository method accepts a tenant ID.
+- Message sends and WebSocket subscriptions check membership. Message-history reads currently
+  filter by tenant and channel but do not check membership, so private channels do not yet provide
+  a complete read-access boundary. The WebSocket origin check also accepts all origins.
 
 ### Rate Limiting (`internal/middleware/ratelimit.go`)
 
@@ -475,25 +478,27 @@ On SIGINT/SIGTERM:
 
 ## 11. Scaling & Capacity Planning
 
-EchoStream is designed to scale **horizontally on stateless server instances** behind a load
-balancer, with Redis and Postgres as the shared state tier.
+The message fan-out path can use multiple application instances with shared Redis and PostgreSQL.
+Each instance still owns WebSocket state, typing events, and local presence counts. The following
+are design considerations, not measured capacity results.
 
 | Dimension | Bottleneck | Scaling lever |
 |---|---|---|
 | **HTTP throughput** | CPU on API instances | Add instances; they are stateless for REST. |
-| **WebSocket fan-out** | Open FDs / memory per instance | Add instances; connections spread by the LB. Delivery correctness is instance-independent thanks to Redis. |
+| **WebSocket fan-out** | Open FDs / memory per instance | Redis forwards message events between instances; test delivery gaps, backpressure, and reconnects before sizing. |
 | **Message writes** | Postgres write IOPS | Connection pooling (pgxpool); later: partition `messages` by `tenant_id` or by time. |
 | **Message history reads** | Index scans on hot channels | `(channel_id, id)` cursor index; later: read replicas / cache recent messages in Redis. |
 | **Redis pub/sub** | Fan-out CPU on a single Redis | Redis Cluster / sharded pub/sub keyed by channel; or a dedicated broker (NATS/Kafka) for very high fan-out. |
 
-**Back-of-envelope:** with fixed-window limits at 60 req/min/user, 10k concurrent active users
-generate ≈ 10k writes/min ≈ 167 writes/s — comfortable for a single Postgres primary. WebSocket
-fan-out is the earlier scaling concern: a viral channel with 50k subscribers turns one write into 50k
-socket frames, spread across however many instances hold those connections.
+**Illustrative sizing:** 10,000 users sending one message per minute would generate about
+167 message writes per second. If each used the entire 60-request/minute allowance for writes,
+the upper bound would instead be 10,000 writes per second, before fan-out. Neither workload has
+been measured here. A channel with 50,000 subscribers would require up to 50,000 socket deliveries
+per message; actual limits depend on payloads, connection counts, database resources, and failures.
 
-**Stickiness:** the LB does *not* need sticky sessions for correctness (Redis reconnects producers
-and consumers). Sticky routing only helps keep a client's REST calls and its WebSocket on the same
-box, which is a minor locality optimization, not a requirement.
+**Routing:** REST sends and WebSocket recipients can be on different instances for message events.
+That does not make every feature instance-independent: typing, presence-change events, and local
+connection counts still need cross-instance coordination.
 
 ---
 
@@ -506,6 +511,9 @@ box, which is a minor locality optimization, not a requirement.
 | **Slow WebSocket client** | Could stall delivery. | Per-client buffered `send` channel; non-blocking enqueue drops for a slow client rather than blocking the hub. |
 | **Instance crash** | Its WebSocket connections drop. | Clients reconnect (to any instance), re-subscribe, and fetch missed history. No server-side session state is lost that matters. |
 | **PUBLISH after persist fails** | Subscribers miss the live push. | Logged; message is durable and appears on next history load. |
+| **Private-channel history request by a non-member in the same tenant** | History reads lack a membership check. | Known authorization gap; add and test the check before treating private channels as an access boundary. |
+| **Last local connection closes while another instance still has the user** | The shared presence key is deleted prematurely. | Known limitation; per-connection presence leases are not implemented. |
+| **Send immediately after channel creation** | Creator membership is inserted in a background goroutine after the response. | An immediate send or subscription can fail; channel creation and membership need a shared transaction. |
 | **JWT secret rotation** | All active tokens invalidated. | Documented operational consequence; plan rotation windows. |
 | **Rate-limit boundary burst** | Brief 2× over-limit. | Accepted tradeoff of fixed window; sliding window on roadmap. |
 
@@ -519,7 +527,7 @@ box, which is a minor locality optimization, not a requirement.
 | **Repository interfaces + Postgres impl** | Swappable data layer; services unit-testable with mocks. | Boilerplate per entity. |
 | **Persist-then-publish** | Durability first; real-time is additive. | A publish failure means a client relies on history fetch for that message. |
 | **Redis pub/sub for fan-out** | Simple, horizontal scaling without sticky sessions. | Redis pub/sub is fire-and-forget (no replay); a subscriber offline during a publish misses the live event (recovered via history). |
-| **Lock-free single-goroutine Hub** | No mutexes, no data races, easy to reason about. | All events serialize through one goroutine; extreme fan-out may need sharded hubs. |
+| **Single-owner Hub** | One goroutine owns the maps, simplifying mutation order. | Events and Redis callbacks share a serialization point and can block one another. |
 | **`bigserial` message IDs** | Cheap ordering + cursor pagination. | Sequential IDs leak volume; not globally unique across shards (fine for single primary). |
 | **Denormalized `tenant_id` on messages** | Fast tenant-scoped reads without joins. | Slight write redundancy; must stay consistent with channel's tenant. |
 | **Rate limiter fails open** | Availability > strictness for chat. | A Redis outage temporarily disables limiting. |
@@ -528,10 +536,9 @@ box, which is a minor locality optimization, not a requirement.
 
 ## 14. Roadmap — What to Build Next
 
-EchoStream today is a **solid real-time core**: auth, tenancy, channels, memberships, durable
-messages, WebSocket delivery, presence, typing, rate limiting, and graceful shutdown. To make it a
-*serious* SDE2 portfolio project, the following extensions each teach a distinct
-backend/system-design competency. They are ordered to build on one another.
+The sections below are proposals. Before expanding the product, address private-channel history
+authorization, transactional channel creation, cross-instance presence, and WebSocket origin
+validation, then exercise them in integration tests.
 
 ### Phase 1 — Product depth (message semantics)
 - **Message edits & deletes** (`PATCH`/`DELETE .../messages/:mid`) with `edited_at` / soft-delete
@@ -551,7 +558,7 @@ backend/system-design competency. They are ordered to build on one another.
 - **Sliding-window rate limiter** (Redis sorted sets) replacing the fixed window. *Teaches:* the
   classic rate-limiter design-interview progression.
 - **Outbox for cross-service events** if you add downstream consumers (search indexer, notifications).
-  *Teaches:* transactional outbox, the pattern Nimbus is built around.
+  *Teaches:* transactional outbox and the difference between persistence and event publication.
 
 ### Phase 3 — Search & scale
 - **Full-text message search** (Postgres `tsvector`, then Elasticsearch/OpenSearch). *Teaches:*
@@ -572,9 +579,9 @@ backend/system-design competency. They are ordered to build on one another.
 - **Test coverage & load tests** — grow the table-driven unit tests, add integration tests
   (testcontainers) and a WebSocket load test (k6). *Teaches:* verification at scale.
 
-> Suggested first slice: **Phase 1 message edits/deletes + Phase 2 idempotency + Phase 4 metrics.**
-> Together they round out the write path, make it correct under retries, and make it observable —
-> the three things an SDE2 reviewer looks for first.
+The existing CI builds and tests the backend, builds and lints the frontend, and checks Compose
+configuration and fresh schema initialization. Multi-instance behavior and load testing remain
+separate work.
 
 ---
 
@@ -584,12 +591,11 @@ backend/system-design competency. They are ordered to build on one another.
    nothing is acknowledged before it is durable.
 2. **Business logic lives in services.** Handlers parse and format; repositories do SQL; services
    decide.
-3. **Tenant isolation is enforced at the query layer**, not just implied by foreign keys.
-4. **Real-time state is owned by one goroutine.** The lock-free Hub is the serialization point — no
-   mutexes, no races.
-5. **Redis decouples producers from connections.** Any instance can accept a write; every instance
-   can deliver it. No sticky sessions required for correctness.
-6. **Degrade gracefully.** Redis outages disable real-time and rate limiting but never lose messages;
-   the rate limiter fails open.
+3. **Tenant filters and membership checks solve different problems.** Both are needed for private
+   channel authorization; the current history-read gap is documented above.
+4. **The Hub's mutable state has one owner.** Its event loop is a serialization point and can block.
+5. **Redis decouples message producers from connections.** Message events can cross instances;
+   typing and presence-change events currently remain local.
+6. **Keep persistence separate from live delivery.** Redis outages can lose live events; saved
+   message rows remain in PostgreSQL, and the rate limiter fails open.
 7. **Shut down cleanly.** Drain HTTP, then tear down dependencies in order.
-```
