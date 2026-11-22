@@ -115,6 +115,7 @@ jobs:
           docker compose run -d --no-deps --name echostream-ci-peer -p 127.0.0.1:8082:8081 api
           curl --fail --retry 12 --retry-all-errors --retry-delay 1 http://127.0.0.1:8082/v1/ready
           node scripts/smoke.mjs http://127.0.0.1:8082 http://127.0.0.1:5173
+          node scripts/reconnect-load.mjs http://127.0.0.1:8082 http://127.0.0.1:5173
           node scripts/recovery.mjs http://127.0.0.1:8082 http://127.0.0.1:5173
       - name: Show service logs on failure
         if: failure()
