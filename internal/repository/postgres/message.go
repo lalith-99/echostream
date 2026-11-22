@@ -24,7 +24,7 @@ func NewMessageStore(pool *pgxpool.Pool) *MessageStore {
 
 // Include both tenant checks to handle memberships imported from older releases.
 const messageMembership = `
-	SELECT 1 FROM channels c
+	FROM channels c
 	JOIN channel_members cm ON cm.channel_id = c.id
 	JOIN users u ON u.id = cm.user_id AND u.tenant_id = c.tenant_id
 	WHERE c.tenant_id = $1 AND c.id = $2 AND cm.user_id = $3`
@@ -57,7 +57,7 @@ func (s *MessageStore) Create(ctx context.Context, tenantID, channelID, senderID
 	// A committed high-water mark can then never skip a later commit with a
 	// smaller ID. Other channels can write independently. Locking membership
 	// prevents a concurrent leave between authorization and insertion.
-	err = checkMessageMembership(ctx, tx, messageMembership+" FOR NO KEY UPDATE OF c FOR SHARE OF cm", tenantID, channelID, senderID)
+	err = checkMessageMembership(ctx, tx, "SELECT 1 "+messageMembership+" FOR NO KEY UPDATE OF c FOR SHARE OF cm", tenantID, channelID, senderID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -96,36 +96,37 @@ func (s *MessageStore) Create(ctx context.Context, tenantID, channelID, senderID
 }
 
 func (s *MessageStore) ListByChannel(ctx context.Context, tenantID, channelID, userID uuid.UUID, page repository.MessagePage) ([]models.Message, error) {
-	// Check membership and read history at one consistent point in time.
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-	if err := checkMessageMembership(ctx, tx, messageMembership, tenantID, channelID, userID); err != nil {
-		return nil, err
-	}
-
-	query := "SELECT " + messageFields + ` FROM messages WHERE tenant_id = $1 AND channel_id = $2`
-	args := []any{tenantID, channelID, page.Limit}
+	// A single statement gives the authorization check and the keyset page the
+	// same MVCC snapshot. No membership produces zero rows. An authorized empty
+	// page produces one outer-join row with a NULL message ID.
+	order, cursor := "DESC", ""
+	args := []any{tenantID, channelID, userID, page.Limit}
 	switch {
 	case page.After != nil:
-		query += " AND id > $4 ORDER BY id ASC"
+		order, cursor = "ASC", " AND id > $5"
 		args = append(args, *page.After)
 	case page.Before > 0:
-		query += " AND id < $4 ORDER BY id DESC"
+		cursor = " AND id < $5"
 		args = append(args, page.Before)
-	default:
-		query += " ORDER BY id DESC"
 	}
 
-	rows, err := tx.Query(ctx, query+" LIMIT $3", args...)
+	query := `SELECT p.id, p.channel_id, p.sender_id, p.body, p.created_at
+		FROM (SELECT c.id ` + messageMembership + `) AS member
+		LEFT JOIN LATERAL (SELECT ` + messageFields + ` FROM messages
+			WHERE tenant_id = $1 AND channel_id = member.id` + cursor +
+		" ORDER BY id " + order + " LIMIT $4) AS p ON true ORDER BY p.id " + order
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list messages: %w", err)
 	}
 	defer rows.Close()
 	messages := make([]models.Message, 0)
+	authorized := false
 	for rows.Next() {
+		authorized = true
+		if rows.RawValues()[0] == nil {
+			continue
+		}
 		msg, err := scanMessage(rows)
 		if err != nil {
 			return nil, err
@@ -135,5 +136,8 @@ func (s *MessageStore) ListByChannel(ctx context.Context, tenantID, channelID, u
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return messages, tx.Commit(ctx)
+	if !authorized {
+		return nil, repository.ErrMessageForbidden
+	}
+	return messages, nil
 }

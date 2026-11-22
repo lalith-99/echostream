@@ -88,6 +88,12 @@ func TestPostgresMessageOutbox(t *testing.T) {
 	exec("INSERT INTO channels (id,tenant_id,name,is_private) VALUES ($1,$2,'test',true)", channel, tenant)
 	exec("INSERT INTO channel_members (channel_id,user_id,role) VALUES ($1,$2,'admin')", channel, user)
 
+	// An authorized empty page is a JSON array. Inaccessible channels are forbidden.
+	empty, err := store.ListByChannel(ctx, tenant, channel, user, repository.MessagePage{Limit: 50})
+	if err != nil || empty == nil || len(empty) != 0 {
+		t.Fatalf("authorized empty page: %v, %v", empty, err)
+	}
+
 	// Force a failure after the message INSERT to prove the API cannot
 	// acknowledge a durable message that lacks its publish intent.
 	exec("ALTER TABLE message_outbox ADD CONSTRAINT simulated_failure CHECK (message_id < 0)")
