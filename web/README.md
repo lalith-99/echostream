@@ -28,5 +28,14 @@ Vite connects to `http://localhost:8081` by default. Production builds use the w
 | Command | What it covers |
 |---|---|
 | `npm test` | Duplicate and out-of-order delivery, multipage recovery, partial failure, bounded live history and channel cancellation |
+| `npm run test:browser` | Two Chromium sessions create and join a workspace, retry a committed send after its response is lost, verify live delivery, disconnect a reader and recover the missed message from history |
 | `npm run lint` | ESLint and React Hooks checks |
 | `npm run build` | TypeScript validation and optimized assets in `dist/` |
+
+The browser check runs against the assembled stack. After `make up`, run
+`npx playwright-core install chromium` and `npm run test:browser` from
+`web/`. To use an installed Chrome executable, set `CHROME_PATH` to its path.
+The default target is `http://localhost:5173`. For another test instance,
+set both `ECHO_BROWSER_URL` and the API's `FRONTEND_BASE_URL` to the web
+origin, and include it in `CORS_ALLOWED_ORIGINS`. Each run creates an isolated
+test workspace and two accounts.

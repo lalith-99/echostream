@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -66,5 +67,44 @@ func TestSubscribedGatewaysReceiveFirstPublication(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatal("first published event did not reach both gateways")
 		}
+	}
+}
+
+func TestBridgePreservesPublicFieldsAndStripsInternalTracing(t *testing.T) {
+	for _, tc := range []struct {
+		name, input, want string
+		unchanged         bool
+	}{
+		{"legacy public frame", ` {"type":"message","message":{"id":12},"extra":false} `, `{"type":"message","message":{"id":12},"extra":false}`, true},
+		{"trace after event", `{"type":"message","traceparent":"old","extra":8}`, `{"type":"message","extra":8}`, false},
+		{"escaped private key", `{"trace\u0070arent":"old","type":"message"}`, `{"type":"message"}`, false},
+		{"private key first", `{"traceparent":null,"type":"message","message":{"traceparent":"public"}}`, `{"type":"message","message":{"traceparent":"public"}}`, false},
+		{"nested arbitrary text", `{"type":"message","message":{"note":"traceparent","body":"\u03b1"}}`, `{"type":"message","message":{"note":"traceparent","body":"α"}}`, true},
+		{"malformed object", `{"type":`, "", false},
+		{"malformed traced object", `{"traceparent":`, "", false},
+		{"nonobject", `[]`, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &captureHub{target: uuid.New(), received: make(chan receivedEvent, 1)}
+			ps := PubSub{hub: h}
+			ps.deliver(context.Background(), h.target, []byte(tc.input))
+			select {
+			case got := <-h.received:
+				if tc.want == "" {
+					t.Fatalf("invalid frame reached broadcaster: %s", got.payload)
+				}
+				var actual, expected map[string]any
+				if json.Unmarshal(got.payload, &actual) != nil || json.Unmarshal([]byte(tc.want), &expected) != nil || !reflect.DeepEqual(actual, expected) {
+					t.Fatalf("got %s; want %s", got.payload, tc.want)
+				}
+				if tc.unchanged && string(got.payload) != tc.input {
+					t.Fatalf("public frame changed: %s", got.payload)
+				}
+			default:
+				if tc.want != "" {
+					t.Fatal("valid frame did not reach broadcaster")
+				}
+			}
+		})
 	}
 }

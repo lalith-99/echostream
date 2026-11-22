@@ -7,11 +7,11 @@ In the recorded run, 20 different accounts held 20 simultaneous WebSocket connec
 | Accepted sends | 10 of 10 |
 | Unique reader/message pairs | 200 of 200 |
 | Missing pairs / duplicate frames observed | 0 / 0 |
-| Median POST start to WebSocket observation | 16.5 ms |
-| p95 / p99 | 35 ms / 41.09 ms |
-| Maximum | 55 ms |
+| Median POST start to WebSocket observation | 5 ms |
+| p95 / p99 | 10 ms / 10 ms |
+| Maximum | 10 ms |
 
-Both Go processes, PostgreSQL 17.12, Redis 8.0.2 and k6 2.4.0 ran on one Linux amd64 host over loopback. Go 1.25.6 built the backend. Each latency sample starts when k6 issues the sender's HTTP request and ends when k6 handles the first matching frame on one reader. The harness verifies durable IDs against the HTTP response and counts distinct reader/ID pairs. All subscribers were connected before measurement. The sample covers roughly one second of writes and excludes Internet links, TLS, client rendering and connection setup. It measures this workload on this machine. A sustained throughput limit would require a longer saturation test with independently sized nodes.
+Both Go processes, PostgreSQL 17.12, Redis 8.0.2 and k6 2.4.0 ran on one Linux amd64 host over loopback. Go 1.26.11 built the backend. The native test used an ephemeral Redis instance with persistence disabled and a freshly migrated database. One k6 virtual user coordinates all sockets and timestamps sends and receipts on the same clock. Each latency sample starts when k6 issues the sender's HTTP request and ends when k6 handles the first matching frame on one reader. The harness verifies durable IDs against the HTTP response and counts distinct reader/ID pairs. All subscribers were connected before measurement. The sample covers roughly one second of writes and excludes Internet links, TLS, client rendering and connection setup. It measures this workload on this machine. A sustained throughput limit would require a longer saturation test with independently sized nodes.
 
 [Raw k6 summary](fanout-local.json) · [Test script](../../scripts/fanout.k6.js)
 

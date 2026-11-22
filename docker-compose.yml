@@ -1,6 +1,12 @@
 # Local deployment. Published ports bind to loopback. Use managed secrets and
 # TLS at your public ingress when deploying externally.
-x-database-url: &database-url postgres://${DB_USER:-echostream}:${DB_PASSWORD:-echostream123}@postgres:5432/${DB_NAME:-echostream}?sslmode=disable
+# Pass credentials as separate pgx connection defaults so punctuation in a
+# password or database name is never parsed as part of a connection URI.
+x-database: &database
+  DATABASE_URL: postgres://postgres:5432?sslmode=disable
+  PGUSER: ${DB_USER:-echostream}
+  PGPASSWORD: ${DB_PASSWORD:-echostream123}
+  PGDATABASE: ${DB_NAME:-echostream}
 x-app-image: &app-image
   build: .
 
@@ -23,6 +29,9 @@ services:
 
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis_data:/data
     ports:
       - "127.0.0.1:6379:6379"
     healthcheck:
@@ -34,8 +43,7 @@ services:
   migrate:
     <<: *app-image
     command: ["/app/migrate"]
-    environment:
-      DATABASE_URL: *database-url
+    environment: *database
     depends_on:
       postgres:
         condition: service_healthy
@@ -45,9 +53,9 @@ services:
     ports:
       - "127.0.0.1:8081:8081"
     environment:
+      <<: *database
       ENV: development
       PORT: "8081"
-      DATABASE_URL: *database-url
       REDIS_URL: redis://redis:6379
       JWT_SECRET: ${JWT_SECRET:-local-only-echostream-development-secret}
       FRONTEND_BASE_URL: http://localhost:5173
@@ -78,3 +86,4 @@ services:
 
 volumes:
   postgres_data:
+  redis_data:

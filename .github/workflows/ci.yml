@@ -43,6 +43,10 @@ jobs:
       - run: make build
       - run: DATABASE_URL="$TEST_DATABASE_URL" bin/migrate
       - run: go vet ./...
+      - name: Check reachable Go vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
+          govulncheck ./...
       - run: make test
 
   frontend:
@@ -60,6 +64,7 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
+      - run: npm audit --audit-level=high
       - run: npm run lint
       - run: npm test
       - run: npm run build
@@ -76,10 +81,17 @@ jobs:
       - name: Initialize a legacy database (pre-migration-ledger)
         run: |
           docker compose config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.tracing.yml config --quiet
           docker compose up -d --wait postgres redis
           db=(docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U echostream -d echostream)
           for sql in migrations/00[123]_*.up.sql; do "${db[@]}" < "$sql"; done
-          "${db[@]}" -c "INSERT INTO tenants(name) VALUES ('legacy-data-marker')"
+          "${db[@]}" <<'SQL'
+          WITH t AS (INSERT INTO tenants(name) VALUES ('legacy-data-marker') RETURNING id),
+               u AS (INSERT INTO users(tenant_id,email) SELECT id,'legacy@example.com' FROM t RETURNING id,tenant_id),
+               c AS (INSERT INTO channels(tenant_id,name) SELECT id,'legacy-channel' FROM t RETURNING id,tenant_id)
+          INSERT INTO messages(tenant_id,channel_id,sender_id,body)
+            SELECT c.tenant_id,c.id,u.id,'retained message' FROM c JOIN u USING (tenant_id);
+          SQL
       - name: Build and start the complete application
         run: make up
       - name: Verify upgrade and repeat migration with existing data
@@ -87,7 +99,7 @@ jobs:
           docker compose run --rm --no-deps migrate
           db=(docker compose exec -T postgres psql -Atq -v ON_ERROR_STOP=1 -U echostream -d echostream)
           test "$("${db[@]}" -c 'SELECT count(*) FROM echostream_schema_migrations')" = "$(ls migrations/*.up.sql | wc -l)"
-          test "$("${db[@]}" -c "SELECT count(*) FROM tenants WHERE name='legacy-data-marker'")" = 1
+          test "$("${db[@]}" -c "SELECT count(*) FROM messages m JOIN channels c ON c.id=m.channel_id AND c.tenant_id=m.tenant_id JOIN users u ON u.id=m.sender_id AND u.tenant_id=m.tenant_id WHERE m.body='retained message' AND u.email='legacy@example.com' AND c.name='legacy-channel'")" = 1
           curl -fsS http://127.0.0.1:5173/ | grep -q 'id="root"'
           curl -fsS http://127.0.0.1:5173/v1/ready
       - name: Exercise signup, chat and reconnect in Chrome

@@ -1,6 +1,7 @@
 package redis
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -76,15 +77,25 @@ func (ps *PubSub) Listen(ctx context.Context) {
 // Trace propagation is internal to the relay and gateway. Only the public
 // event fields are forwarded to the browser.
 func (ps *PubSub) deliver(ctx context.Context, channel uuid.UUID, payload []byte) {
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &envelope); err != nil || envelope == nil {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return
 	}
 	var parent string
-	if value, ok := envelope["traceparent"]; ok {
-		_ = json.Unmarshal(value, &parent)
-		delete(envelope, "traceparent")
-		payload, _ = json.Marshal(envelope)
+	// Plain public frames need no map or body copy. A Unicode escape may
+	// spell a field name, so those inputs go through the normal JSON decoder.
+	if bytes.Contains(trimmed, []byte(`"traceparent"`)) || bytes.Contains(trimmed, []byte(`\u`)) {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(trimmed, &fields) != nil {
+			return
+		}
+		if private, ok := fields["traceparent"]; ok {
+			_ = json.Unmarshal(private, &parent)
+			delete(fields, "traceparent")
+			payload, _ = json.Marshal(fields)
+		}
+	} else if !json.Valid(trimmed) {
+		return
 	}
 	_, span := observ.StartLinked(ctx, parent, "redis.fanout")
 	defer span.End()

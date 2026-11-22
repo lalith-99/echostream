@@ -9,6 +9,7 @@ import (
 )
 
 const devSecret = "dev-secret-do-not-use-in-prod"
+const composeSecret = "local-only-echostream-development-secret"
 
 type Config struct {
 	Port, AdminPort, LogLevel, Env   string
@@ -37,8 +38,8 @@ func LoadConfig() (*Config, error) {
 				return nil, fmt.Errorf("%s is required in production", name)
 			}
 		}
-		if len(strings.TrimSpace(cfg.JWTSecret)) < 32 || strings.TrimSpace(cfg.JWTSecret) == devSecret {
-			return nil, fmt.Errorf("JWT_SECRET must contain at least 32 bytes in production")
+		if secret := strings.TrimSpace(cfg.JWTSecret); len(secret) < 32 || secret == devSecret || secret == composeSecret {
+			return nil, fmt.Errorf("JWT_SECRET must be a private signing secret of at least 32 bytes in production")
 		}
 		if len(cfg.CORSAllowedOrigins) == 0 {
 			return nil, fmt.Errorf("CORS_ALLOWED_ORIGINS must contain at least one HTTPS origin")
