@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useAuthStore } from '../store/authStore';
 import { WS_BASE_URL } from '../lib/env';
 import type { InboundEvent, OutboundEvent } from '../lib/types';
 
@@ -30,7 +31,7 @@ export function useWebSocket(
       if (cancelled) return;
       setStatus('connecting');
 
-      const ws = new WebSocket(`${WS_BASE_URL}/v1/ws?token=${token}`);
+      const ws = new WebSocket(`${WS_BASE_URL}/v1/ws`, ['echostream.v1', `bearer.${token}`]);
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -50,11 +51,16 @@ export function useWebSocket(
         }
       };
 
-      const handleClose = () => {
+      const handleClose = (event: CloseEvent) => {
         if (cancelled) return;
         wsRef.current = null;
         setStatus('disconnected');
-        const delay = Math.min(1000 * 2 ** attempt.current, 30_000);
+        const session = useAuthStore.getState();
+        if (event.code === 1008 && session.token === token && !session.isAuthenticated()) {
+          session.logout();
+          return;
+        }
+        const delay = (0.5 + Math.random() * 0.5) * Math.min(1000 * 2 ** attempt.current, 30_000);
         attempt.current++;
         reconnectTimer.current = setTimeout(connect, delay);
       };
@@ -75,7 +81,11 @@ export function useWebSocket(
 
   const send = useCallback((msg: InboundEvent) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg));
+      try {
+        wsRef.current.send(JSON.stringify(msg));
+      } catch {
+        // A socket may already be closing. Reconnection resubscribes.
+      }
     }
   }, []);
 

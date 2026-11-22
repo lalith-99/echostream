@@ -1,0 +1,19 @@
+{
+  "readers": 20,
+  "messages": 10,
+  "issue_interval_ms": 100,
+  "expected_deliveries": 200,
+  "subscribed_readers": 20,
+  "accepted_writes": 10,
+  "unique_deliveries": 200,
+  "missing_deliveries": 0,
+  "duplicate_deliveries_observed": 0,
+  "invalid_results": 0,
+  "post_to_websocket_ms": {
+    "min": 3,
+    "med": 16.5,
+    "p(95)": 35,
+    "p(99)": 41.08999999999992,
+    "max": 55
+  }
+}

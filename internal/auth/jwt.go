@@ -43,20 +43,17 @@ func GenerateToken(userID, tenantID uuid.UUID, email, secret string, ttl time.Du
 // ParseToken validates a JWT string and returns the claims.
 func ParseToken(tokenString, secret string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{},
-		func(token *jwt.Token) (any, error) {
-			// Reject non-HMAC signing methods to prevent algorithm confusion attacks.
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-			}
-			return []byte(secret), nil
-		},
+		func(*jwt.Token) (any, error) { return []byte(secret), nil },
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer("echostream"),
+		jwt.WithExpirationRequired(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("parse token: %w", err)
 	}
 
 	claims, ok := token.Claims.(*Claims)
-	if !ok || !token.Valid {
+	if !ok || !token.Valid || claims.UserID == uuid.Nil || claims.TenantID == uuid.Nil {
 		return nil, fmt.Errorf("invalid token claims")
 	}
 

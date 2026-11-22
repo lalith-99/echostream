@@ -40,11 +40,12 @@ func (h *UserHandler) GetMe(c *gin.Context) {
 	c.JSON(http.StatusOK, user)
 }
 
-// List handles GET /v1/users — returns all users in the caller's tenant.
+// List handles GET /v1/users?limit=100&offset=0.
 func (h *UserHandler) List(c *gin.Context) {
 	tenantID := middleware.GetTenantID(c)
 
-	users, err := h.repo.ListByTenant(c.Request.Context(), tenantID)
+	limit, offset := parsePagination(c, 100, 200)
+	users, err := h.repo.ListByTenant(c.Request.Context(), tenantID, middleware.GetUserID(c), limit, offset)
 	if err != nil {
 		h.logger.Error("failed to list users", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list users"})

@@ -1,26 +1,27 @@
 package api
 
 import (
-	"context"
+	"errors"
 	"net/http"
-	"time"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lalith-99/echostream/internal/middleware"
+	"github.com/lalith-99/echostream/internal/models"
 	"github.com/lalith-99/echostream/internal/repository"
 	"go.uber.org/zap"
 )
 
 type ChannelHandler struct {
-	repo       repository.ChannelRepository
-	membership repository.MembershipRepository
-	logger     *zap.Logger
+	repo   repository.ChannelRepository
+	logger *zap.Logger
 }
 
 // NewChannelHandler returns a ChannelHandler.
-func NewChannelHandler(repo repository.ChannelRepository, membership repository.MembershipRepository, logger *zap.Logger) *ChannelHandler {
-	return &ChannelHandler{repo: repo, membership: membership, logger: logger}
+func NewChannelHandler(repo repository.ChannelRepository, logger *zap.Logger) *ChannelHandler {
+	return &ChannelHandler{repo: repo, logger: logger}
 }
 
 type createChannelRequest struct {
@@ -38,14 +39,19 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 		return
 	}
 
-	if len(req.Name) > maxChannelNameLen {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "channel name must be 80 characters or less"})
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || utf8.RuneCountInString(req.Name) > maxChannelNameLen {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "channel name must be between 1 and 80 characters"})
 		return
 	}
 
 	tenantID := middleware.GetTenantID(c)
 
-	ch, err := h.repo.Create(c.Request.Context(), tenantID, req.Name, req.IsPrivate)
+	ch, err := h.repo.Create(c.Request.Context(), tenantID, middleware.GetUserID(c), req.Name, req.IsPrivate)
+	if errors.Is(err, repository.ErrMembershipUnavailable) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "workspace membership required"})
+		return
+	}
 	if err != nil {
 		h.logger.Error("failed to create channel", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create channel"})
@@ -53,16 +59,6 @@ func (h *ChannelHandler) Create(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, ch)
-
-	// Run in a goroutine with its own context so request cancellation
-	// (browser closing the connection) can't abort the membership insert.
-	go func(channelID, userID uuid.UUID) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := h.membership.AddMember(ctx, channelID, userID, "admin"); err != nil {
-			h.logger.Error("failed to add creator as admin", zap.Error(err))
-		}
-	}(ch.ID, middleware.GetUserID(c))
 }
 
 // List handles GET /v1/channels?limit=50&offset=0
@@ -84,25 +80,27 @@ func (h *ChannelHandler) List(c *gin.Context) {
 
 // GetByID handles GET /v1/channels/:id
 func (h *ChannelHandler) GetByID(c *gin.Context) {
-	tenantID := middleware.GetTenantID(c)
+	if ch := visibleChannel(c, h.repo, h.logger); ch != nil {
+		c.JSON(http.StatusOK, ch)
+	}
+}
 
+// visibleChannel resolves a channel for its viewer or writes the appropriate response.
+func visibleChannel(c *gin.Context, channels repository.ChannelRepository, logger *zap.Logger) *models.Channel {
 	channelID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid channel id"})
-		return
+		return nil
 	}
 
-	ch, err := h.repo.GetByID(c.Request.Context(), tenantID, channelID)
+	ch, err := channels.GetByID(c.Request.Context(), middleware.GetTenantID(c), channelID, middleware.GetUserID(c))
 	if err != nil {
-		h.logger.Error("failed to get channel", zap.Error(err))
+		logger.Error("failed to get channel", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to get channel"})
-		return
+		return nil
 	}
-
 	if ch == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "channel not found"})
-		return
 	}
-
-	c.JSON(http.StatusOK, ch)
+	return ch
 }

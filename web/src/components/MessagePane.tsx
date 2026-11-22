@@ -2,17 +2,19 @@ import {
   useCallback,
   useEffect,
   useRef,
+  useMemo,
   useState,
   type FormEvent,
   type KeyboardEvent,
 } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { Hash, Lock, MessageSquare, Send } from 'lucide-react';
 import { echostream } from '../lib/api';
 import { useAuthStore } from '../store/authStore';
 import { clsx } from 'clsx';
 import { MembersPanel } from './MembersPanel';
 import type { Channel, InboundEvent, Message, OutboundEvent, User } from '../lib/types';
+import { useChannelHistory } from '../hooks/useChannelHistory';
 import type { WSStatus } from '../hooks/useWebSocket';
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -82,30 +84,38 @@ function MessageInput({
   onTyping,
 }: {
   channel: Channel;
-  onSend: (content: string) => Promise<void>;
+  onSend: (content: string, key: string) => Promise<void>;
   onTyping: () => void;
 }) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const pending = useRef<{ content: string; key: string } | null>(null);
+  const inFlight = useRef(false);
   async function submit() {
     const content = text.trim();
-    if (!content || sending) return;
+    if (!content || inFlight.current) return;
+    inFlight.current = true;
     setSending(true);
     setError(null);
     try {
-      await onSend(content);
+      if (pending.current?.content !== content) {
+        pending.current = { content, key: crypto.randomUUID() };
+      }
+      await onSend(content, pending.current.key);
+      pending.current = null;
       setText('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Send failed');
     } finally {
+      inFlight.current = false;
       setSending(false);
     }
   }
 
   function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       void submit();
       return;
@@ -128,6 +138,8 @@ function MessageInput({
       <div className="flex items-end gap-2">
         <textarea
           rows={1}
+          aria-label={`Message #${channel.name}`}
+          disabled={sending}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={handleKeyDown}
@@ -141,6 +153,7 @@ function MessageInput({
         />
         <button
           type="submit"
+          aria-label="Send message"
           disabled={!text.trim() || sending}
           className={clsx(
             'flex h-9 w-9 items-center justify-center rounded-xl transition',
@@ -187,30 +200,30 @@ export function MessagePane({ channel, wsStatus, send, onWsEvent }: Props) {
     );
   }
 
-  return <ActivePane channel={channel} wsStatus={wsStatus} send={send} onWsEvent={onWsEvent} />;
+  return <ActivePane key={channel.id} channel={channel} wsStatus={wsStatus} send={send} onWsEvent={onWsEvent} />;
 }
 
 // Separated so hooks only run when a channel IS selected.
 function ActivePane({ channel, wsStatus, send, onWsEvent }: ActiveProps) {
-  const queryClient = useQueryClient();
   const claims = useAuthStore((s) => s.claims);
 
-  const { data: users = [] } = useQuery({
+  const { data: users } = useQuery({
     queryKey: ['users'],
-    queryFn: echostream.listUsers,
+    queryFn: ({ signal }) => echostream.listUsers(signal),
     staleTime: 5 * 60_000,
   });
-  const usersById = new Map(users.map((u) => [u.id, u]));
+  const usersById = useMemo(() => new Map(users?.map((u) => [u.id, u])), [users]);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const [loadingOlder, setLoadingOlder] = useState(false);
+
   // user_ids currently typing in this channel (auto-cleared after 3s of silence).
   const [typingUsers, setTypingUsers] = useState<Map<string, string>>(new Map());
   const typingTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   // Subscribe to incoming WS events for this pane.
   useEffect(() => {
+    const timers = typingTimers.current;
     const unsub = onWsEvent((ev) => {
-      if (ev.type === 'typing' && ev.user_id && ev.user_id !== claims?.user_id) {
+      if (ev.channel_id === channel.id && ev.type === 'typing' && ev.user_id && ev.user_id !== claims?.user_id) {
         const uid = ev.user_id;
         const name = usersById.get(uid)?.display_name ?? uid.slice(0, 8);
         setTypingUsers((prev) => new Map(prev).set(uid, name));
@@ -219,6 +232,7 @@ function ActivePane({ channel, wsStatus, send, onWsEvent }: ActiveProps) {
         typingTimers.current.set(
           uid,
           setTimeout(() => {
+            timers.delete(uid);
             setTypingUsers((prev) => {
               const next = new Map(prev);
               next.delete(uid);
@@ -229,7 +243,7 @@ function ActivePane({ channel, wsStatus, send, onWsEvent }: ActiveProps) {
       }
     });
     return unsub;
-  }, [onWsEvent, claims?.user_id, usersById]);
+  }, [onWsEvent, claims?.user_id, usersById, channel.id]);
 
   // Debounced typing signal sender — fires at most once per second of keystrokes.
   const typingTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -241,45 +255,32 @@ function ActivePane({ channel, wsStatus, send, onWsEvent }: ActiveProps) {
     }, 1000);
   }, [send, channel.id]);
 
-  // Fetch messages (server returns newest-first; select reverses for display).
-  const { data: messages = [], isLoading, isError } = useQuery({
-    queryKey: ['messages', channel.id],
-    queryFn: () => echostream.listMessages(channel.id),
-    select: (data) => [...data].reverse(),
-  });
-
-  // Scroll to newest message on initial load and when new messages arrive via WS.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages.length]);
+    const timers = typingTimers.current;
+    return () => {
+      timers.forEach(clearTimeout);
+      clearTimeout(typingTimeout.current ?? undefined);
+    };
+  }, []);
 
-  // Load up to 50 messages older than the oldest currently visible.
-  async function handleLoadOlder() {
-    const raw = queryClient.getQueryData<Message[]>(['messages', channel.id]) ?? [];
-    // raw is newest-first; the oldest is at the end.
-    const oldestId = raw[raw.length - 1]?.id;
-    if (!oldestId) return;
-    setLoadingOlder(true);
-    try {
-      const older = await echostream.listMessages(channel.id, oldestId);
-      if (older.length > 0) {
-        queryClient.setQueryData<Message[]>(['messages', channel.id], (prev = []) => [
-          ...prev,  // current (newest-first)
-          ...older, // even older (also newest-first within the page)
-        ]);
-      }
-    } finally {
-      setLoadingOlder(false);
-    }
+  const { messages, loading, error, hasOlder, loadingOlder, navigate, browsingHistory, showLatest, add } =
+    useChannelHistory(channel.id, onWsEvent);
+  useEffect(() => {
+    if (wsStatus !== 'connected') return;
+    send({ type: 'subscribe', channel_id: channel.id });
+    return () => send({ type: 'unsubscribe', channel_id: channel.id });
+  }, [channel.id, send, wsStatus]);
+
+  const newest = messages.at(-1)?.id;
+  useEffect(() => {
+    if (!browsingHistory) bottomRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [newest, browsingHistory]);
+
+  async function handleSend(content: string, key: string) {
+    const saved = await echostream.sendMessage(channel.id, content, key);
+    add([saved]);
+    showLatest();
   }
-
-  async function handleSend(content: string) {
-    await echostream.sendMessage(channel.id, content);
-    // Message arrives back via WebSocket — no need to add it manually here.
-    // If WS is disconnected, it'll appear on next reconnect+refetch.
-  }
-
-  const mayHaveOlder = messages.length >= 50;
 
   return (
     <main className="flex flex-1 flex-col overflow-hidden bg-slate-50 dark:bg-slate-950">
@@ -309,17 +310,17 @@ function ActivePane({ channel, wsStatus, send, onWsEvent }: ActiveProps) {
 
       {/* Message list */}
       <div className="flex-1 overflow-y-auto py-2">
-        {isLoading && (
+        {loading && (
           <p className="px-4 py-8 text-center text-sm text-slate-400">Loading messages…</p>
         )}
-        {isError && messages.length === 0 && (
-          <p className="px-4 py-8 text-center text-sm text-red-500">Failed to load messages</p>
+        {error && (
+          <p className="px-4 py-8 text-center text-sm text-red-500">{error}</p>
         )}
 
-        {!isLoading && mayHaveOlder && (
+        {!loading && hasOlder && (
           <div className="flex justify-center py-2">
             <button
-              onClick={() => void handleLoadOlder()}
+              onClick={() => void navigate('older')}
               disabled={loadingOlder}
               className="rounded-full border border-slate-200 bg-white px-4 py-1 text-xs text-slate-500 transition hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400"
             >
@@ -328,7 +329,7 @@ function ActivePane({ channel, wsStatus, send, onWsEvent }: ActiveProps) {
           </div>
         )}
 
-        {!isLoading && messages.length === 0 && (
+        {!loading && !error && messages.length === 0 && (
           <p className="px-4 py-8 text-center text-sm text-slate-400">
             No messages yet. Say something!
           </p>
@@ -337,6 +338,12 @@ function ActivePane({ channel, wsStatus, send, onWsEvent }: ActiveProps) {
         {messages.map((msg) => (
           <MessageBubble key={msg.id} msg={msg} myId={claims?.user_id ?? ''} usersById={usersById} />
         ))}
+        {browsingHistory && (
+          <div className="flex justify-center gap-4 py-3 text-xs text-indigo-600 dark:text-indigo-300">
+            <button disabled={loadingOlder} onClick={() => void navigate('newer')}>Newer messages</button>
+            <button disabled={loadingOlder} onClick={showLatest}>Back to latest</button>
+          </div>
+        )}
         <div ref={bottomRef} />
       </div>
 

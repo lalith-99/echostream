@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
@@ -68,5 +69,31 @@ func TestParseToken_Empty(t *testing.T) {
 	_, err := ParseToken("", testSecret)
 	if err == nil {
 		t.Fatal("expected error for empty token, got nil")
+	}
+}
+
+func TestParseTokenRequiresAccessClaims(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		alter func(*Claims)
+	}{
+		{"expiry", func(c *Claims) { c.ExpiresAt = nil }},
+		{"issuer", func(c *Claims) { c.Issuer = "other" }},
+		{"user", func(c *Claims) { c.UserID = uuid.Nil }},
+		{"workspace", func(c *Claims) { c.TenantID = uuid.Nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Claims{UserID: uuid.New(), TenantID: uuid.New(), RegisteredClaims: jwt.RegisteredClaims{
+				Issuer: "echostream", ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			}}
+			tc.alter(c)
+			token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, c).SignedString([]byte(testSecret))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ParseToken(token, testSecret); err == nil {
+				t.Fatal("accepted incomplete access claims")
+			}
+		})
 	}
 }

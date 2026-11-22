@@ -11,74 +11,110 @@ import (
 )
 
 const (
-	writeWait      = 10 * time.Second
-	pongWait       = 60 * time.Second
-	pingPeriod     = (pongWait * 9) / 10 // 54s
-	maxMessageSize = 4096
-	sendBufSize    = 256
+	writeWait            = 5 * time.Second
+	pongWait             = 60 * time.Second
+	pingPeriod           = 45 * time.Second
+	maxMessageSize       = 4096
+	sendBufSize          = 64
+	maxCommandsPerSecond = 30
 )
 
-// MembershipChecker verifies whether a user belongs to a channel.
-// Injected from the api layer so the websocket package doesn't import repository.
 type MembershipChecker func(ctx context.Context, channelID, userID uuid.UUID) (bool, error)
 
 type Client struct {
 	hub             *Hub
 	conn            *gorillaws.Conn
-	send            chan []byte
+	send            chan frame
+	ctx             context.Context
+	cancel          context.CancelFunc
+	pumpsDone       chan struct{}
 	userID          uuid.UUID
-	tenantID        uuid.UUID
-	checkMembership MembershipChecker // nil = skip check (backwards compat for tests)
+	expires         time.Time
+	checkMembership MembershipChecker
 	logger          *zap.Logger
 }
 
-// NewClient creates a websocket client bound to a hub.
-func NewClient(hub *Hub, conn *gorillaws.Conn, userID, tenantID uuid.UUID, checker MembershipChecker, logger *zap.Logger) *Client {
+func NewClient(hub *Hub, conn *gorillaws.Conn, userID uuid.UUID, expires time.Time, checker MembershipChecker, logger *zap.Logger) *Client {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Client{
-		hub:             hub,
-		conn:            conn,
-		send:            make(chan []byte, sendBufSize),
-		userID:          userID,
-		tenantID:        tenantID,
-		checkMembership: checker,
-		logger:          logger,
+		hub: hub, conn: conn, send: make(chan frame, sendBufSize),
+		ctx: ctx, cancel: cancel, userID: userID, expires: expires,
+		checkMembership: checker, logger: logger,
 	}
 }
 
-// Send queues data for writing to the WebSocket. Drops if buffer is full.
-func (c *Client) Send(data []byte) {
+func (c *Client) stop() {
+	c.cancel()
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+}
+
+func (c *Client) closeWith(code int, reason string) {
+	_ = c.conn.WriteControl(gorillaws.CloseMessage, gorillaws.FormatCloseMessage(code, reason), time.Now().Add(time.Second))
+	c.stop()
+}
+
+// Disconnect a slow socket so its next subscription can recover from history.
+// Silently dropping a queued message would leave a connected client with a gap.
+func (c *Client) enqueue(f frame) {
 	select {
-	case c.send <- data:
+	case <-c.ctx.Done():
+	case c.send <- f:
 	default:
+		c.stop()
 	}
 }
 
-// ReadPump reads messages from the WebSocket and dispatches them to the hub.
-func (c *Client) ReadPump() {
-	defer func() {
-		c.hub.unregister <- c
-		c.conn.Close()
+func (c *Client) Serve() {
+	c.pumpsDone = make(chan struct{})
+	defer close(c.pumpsDone)
+	if !c.hub.Register(c) {
+		c.stop()
+		return
+	}
+	defer c.hub.Unregister(c)
+	expiry := time.AfterFunc(time.Until(c.expires), func() { c.closeWith(gorillaws.ClosePolicyViolation, "session expired") })
+	defer expiry.Stop()
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		c.writePump()
+		c.stop()
 	}()
+	c.readPump()
+	c.stop()
+	<-writerDone
+}
 
+func (c *Client) member(id uuid.UUID) (bool, error) {
+	ctx, cancel := context.WithTimeout(c.ctx, 2*time.Second)
+	defer cancel()
+	return c.checkMembership(ctx, id, c.userID)
+}
+
+func (c *Client) readPump() {
 	c.conn.SetReadLimit(maxMessageSize)
-	c.conn.SetReadDeadline(time.Now().Add(pongWait))
-	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
-	})
-
+	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error { return c.conn.SetReadDeadline(time.Now().Add(pongWait)) })
+	window := time.Now()
+	count := 0
 	for {
-		_, raw, err := c.conn.ReadMessage()
+		kind, raw, err := c.conn.ReadMessage()
 		if err != nil {
-			if gorillaws.IsUnexpectedCloseError(err, gorillaws.CloseGoingAway, gorillaws.CloseNormalClosure) {
-				c.logger.Warn("ws read error", zap.Error(err))
-			}
 			return
 		}
-
+		if time.Since(window) >= time.Second {
+			window = time.Now()
+			count = 0
+		}
+		count++
+		if count > maxCommandsPerSecond {
+			c.closeWith(gorillaws.ClosePolicyViolation, "command rate exceeded")
+			return
+		}
 		var msg InboundMessage
-		if err := json.Unmarshal(raw, &msg); err != nil {
-			c.logger.Debug("invalid ws message", zap.Error(err))
+		if kind != gorillaws.TextMessage || json.Unmarshal(raw, &msg) != nil {
 			c.sendError("invalid message format")
 			continue
 		}
@@ -86,83 +122,67 @@ func (c *Client) ReadPump() {
 	}
 }
 
-// WritePump pumps messages from the send channel to the WebSocket.
-func (c *Client) WritePump() {
-	ticker := time.NewTicker(pingPeriod)
-	defer func() {
-		ticker.Stop()
-		c.conn.Close()
-	}()
+func (c *Client) handleMessage(msg InboundMessage) {
+	id, err := uuid.Parse(msg.ChannelID)
+	if err != nil || id == uuid.Nil {
+		c.sendError("invalid channel_id")
+		return
+	}
+	switch msg.Type {
+	case "subscribe", "typing":
+		allowed, err := c.member(id)
+		if err != nil {
+			c.sendError("membership unavailable")
+			return
+		}
+		if !allowed {
+			c.sendError("not a member of this channel")
+			return
+		}
+	case "unsubscribe":
+	default:
+		c.sendError("unknown message type")
+		return
+	}
+	c.hub.apply(c, msg.Type, id)
+}
 
+func (c *Client) writePump() {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
 	for {
 		select {
-		case data, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				c.conn.WriteMessage(gorillaws.CloseMessage, []byte{})
+		case <-c.ctx.Done():
+			return
+		case f := <-c.send:
+			if f.channel != uuid.Nil {
+				ok, err := c.member(f.channel)
+				if err != nil {
+					c.logger.Warn("websocket membership unavailable", zap.Error(err))
+					return // reconnect triggers a history refresh when the store recovers
+				}
+				if !ok {
+					c.hub.apply(c, "revoked", f.channel)
+					continue
+				}
+			}
+			if !time.Now().Before(c.expires) {
+				c.closeWith(gorillaws.ClosePolicyViolation, "session expired")
 				return
 			}
-			if err := c.conn.WriteMessage(gorillaws.TextMessage, data); err != nil {
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if c.conn.WriteMessage(gorillaws.TextMessage, f.data) != nil {
 				return
 			}
 		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := c.conn.WriteMessage(gorillaws.PingMessage, nil); err != nil {
+			if c.conn.WriteControl(gorillaws.PingMessage, nil, time.Now().Add(writeWait)) != nil {
 				return
 			}
 		}
-	}
-}
-
-func (c *Client) handleMessage(msg InboundMessage) {
-	switch msg.Type {
-	case "subscribe":
-		channelID, err := uuid.Parse(msg.ChannelID)
-		if err != nil {
-			c.sendError("invalid channel_id")
-			return
-		}
-		// Verify caller is a member before subscribing to real-time events
-		if c.checkMembership != nil {
-			ok, err := c.checkMembership(context.Background(), channelID, c.userID)
-			if err != nil {
-				c.logger.Error("membership check failed", zap.Error(err))
-				c.sendError("internal error")
-				return
-			}
-			if !ok {
-				c.sendError("not a member of this channel")
-				return
-			}
-		}
-		c.hub.subscribeCh <- &subscription{client: c, channelID: channelID}
-
-	case "unsubscribe":
-		channelID, err := uuid.Parse(msg.ChannelID)
-		if err != nil {
-			c.sendError("invalid channel_id")
-			return
-		}
-		c.hub.unsubscribeCh <- &subscription{client: c, channelID: channelID}
-
-	case "typing":
-		channelID, err := uuid.Parse(msg.ChannelID)
-		if err != nil {
-			c.sendError("invalid channel_id")
-			return
-		}
-		c.hub.typingCh <- &typingEvent{channelID: channelID, userID: c.userID}
-
-	default:
-		c.sendError("unknown message type: " + msg.Type)
 	}
 }
 
 func (c *Client) sendError(msg string) {
-	data, err := json.Marshal(OutboundEvent{Type: "error", Error: msg})
-	if err != nil {
-		c.logger.Error("failed to marshal error event", zap.Error(err))
-		return
-	}
-	c.Send(data)
+	data, _ := json.Marshal(OutboundEvent{Type: "error", Error: msg})
+	c.enqueue(frame{data: data})
 }

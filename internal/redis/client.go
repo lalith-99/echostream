@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"fmt"
+	"time"
 
 	goredis "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
@@ -21,8 +22,12 @@ func NewClient(redisURL string, logger *zap.Logger) (*Client, error) {
 		return nil, fmt.Errorf("parse redis url: %w", err)
 	}
 
+	opts.ContextTimeoutEnabled = true
 	rdb := goredis.NewClient(opts)
-	if err := rdb.Ping(context.Background()).Err(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		_ = rdb.Close()
 		return nil, fmt.Errorf("ping redis: %w", err)
 	}
 

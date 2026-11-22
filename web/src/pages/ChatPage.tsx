@@ -1,94 +1,74 @@
-import { useCallback, useEffect, useRef } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
 import { echostream } from '../lib/api';
 import { useAuthStore } from '../store/authStore';
-import { useChatStore } from '../store/chatStore';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { Sidebar } from '../components/Sidebar';
 import { MessagePane } from '../components/MessagePane';
-import type { Channel, Message, OutboundEvent } from '../lib/types';
+import type { Channel, OutboundEvent } from '../lib/types';
 
 export function ChatPage() {
   const token = useAuthStore((s) => s.token);
+  return token ? <Session key={token} token={token} /> : null;
+}
+
+// A new login gets an independent cache; slow responses from a previous
+// account cannot repopulate the current workspace's users or channels.
+function Session({ token }: { token: string }) {
+  const [client] = useState(() => new QueryClient({
+    defaultOptions: { queries: { retry: 1, staleTime: 30_000 } },
+  }));
+  return <QueryClientProvider client={client}><Chat token={token} /></QueryClientProvider>;
+}
+
+function Chat({ token }: { token: string }) {
   const claims = useAuthStore((s) => s.claims);
   const logout = useAuthStore((s) => s.logout);
-  const { activeChannel, setActiveChannel } = useChatStore();
-  const queryClient = useQueryClient();
-
-  const meQuery = useQuery({ queryKey: ['me'], queryFn: echostream.me });
-
-  // Stable ref so the WS reconnect effect can read the current channel without
-  // adding it to the effect dependency array (which would restart the connection).
-  const activeChannelRef = useRef(activeChannel);
-  useEffect(() => {
-    activeChannelRef.current = activeChannel;
-  }, [activeChannel]);
-
-  // Listeners that MessagePane components register to receive WS events.
-  const wsListeners = useRef<Set<(ev: OutboundEvent) => void>>(new Set());
-
-  // Incoming WS message → prepend to TanStack Query cache for that channel.
-  // Server returns newest-first; MessagePane's `select` reverses for display.
-  const handleWsEvent = useCallback(
-    (event: OutboundEvent) => {
-      if (event.type === 'message' && event.message && event.channel_id) {
-        queryClient.setQueryData<Message[]>(
-          ['messages', event.channel_id],
-          (prev) => [event.message!, ...(prev ?? [])],
-        );
-      }
-      wsListeners.current.forEach((h) => h(event));
-    },
-    [queryClient],
-  );
-
-  // Stable subscribe function passed down to child components.
-  const onWsEvent = useCallback((handler: (ev: OutboundEvent) => void) => {
-    wsListeners.current.add(handler);
-    return () => wsListeners.current.delete(handler);
+  const [channel, setChannel] = useState<Channel | null>(null);
+  const [joinError, setJoinError] = useState('');
+  const [choosing, setChoosing] = useState('');
+  const selection = useRef(0);
+  const listeners = useRef(new Set<(event: OutboundEvent) => void>());
+  const listen = useCallback((handler: (event: OutboundEvent) => void) => {
+    listeners.current.add(handler);
+    return () => { listeners.current.delete(handler); };
   }, []);
+  const emit = useCallback((event: OutboundEvent) => {
+    listeners.current.forEach((handler) => handler(event));
+  }, []);
+  const { send, status } = useWebSocket(token, emit);
+  const me = useQuery({ queryKey: ['me'], queryFn: echostream.me });
 
-  const { send, status: wsStatus } = useWebSocket(token, handleWsEvent);
-
-  // Re-subscribe to the active channel whenever the WS reconnects.
   useEffect(() => {
-    if (wsStatus === 'connected' && activeChannelRef.current) {
-      send({ type: 'subscribe', channel_id: activeChannelRef.current.id });
+    if (!claims) return;
+    const timer = setTimeout(logout, Math.max(0, claims.exp * 1000 - Date.now()));
+    return () => clearTimeout(timer);
+  }, [claims, logout]);
+
+  async function choose(next: Channel) {
+    const request = ++selection.current;
+    setChoosing(next.name);
+    setJoinError('');
+    try {
+      if (!next.is_private) await echostream.joinChannel(next.id);
+      if (request === selection.current) setChannel(next);
+    } catch (err) {
+      if (request === selection.current) setJoinError(err instanceof Error ? err.message : 'Could not open channel.');
+    } finally {
+      if (request === selection.current) setChoosing('');
     }
-  }, [wsStatus, send]);
-
-  const prevChannelId = useRef<string | null>(null);
-
-  const handleSelectChannel = useCallback(
-    async (channel: Channel) => {
-      if (prevChannelId.current && prevChannelId.current !== channel.id) {
-        send({ type: 'unsubscribe', channel_id: prevChannelId.current });
-      }
-      setActiveChannel(channel);
-      prevChannelId.current = channel.id;
-      // Invalidate so the message list always refetches from scratch on channel switch.
-      queryClient.invalidateQueries({ queryKey: ['messages', channel.id] });
-      try {
-        await echostream.joinChannel(channel.id);
-      } catch {
-        // Idempotent — non-fatal if already a member.
-      }
-      send({ type: 'subscribe', channel_id: channel.id });
-    },
-    [send, setActiveChannel],
-  );
+  }
 
   return (
     <div className="flex h-full">
-      <Sidebar
-        activeChannelId={activeChannel?.id}
-        onSelectChannel={(ch) => void handleSelectChannel(ch)}
-        onLogout={logout}
-        userName={meQuery.data?.display_name ?? '…'}
-        userEmail={meQuery.data?.email ?? ''}
-        workspaceId={claims?.tenant_id ?? ''}
-      />
-      <MessagePane channel={activeChannel} wsStatus={wsStatus} send={send} onWsEvent={onWsEvent} />
+      <Sidebar activeChannelId={channel?.id} onSelectChannel={(ch) => void choose(ch)}
+        onLogout={logout} userName={me.data?.display_name ?? '…'}
+        userEmail={me.data?.email ?? ''} workspaceId={claims?.tenant_id ?? ''} />
+      <div className="flex min-w-0 flex-1 flex-col">
+        {choosing && <p role="status" className="px-4 py-2 text-xs">Opening #{choosing}…</p>}
+        {joinError && <p role="alert" className="px-4 py-2 text-sm text-red-500">{joinError}</p>}
+        <MessagePane channel={channel} wsStatus={status} send={send} onWsEvent={listen} />
+      </div>
     </div>
   );
 }

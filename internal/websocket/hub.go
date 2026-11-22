@@ -1,265 +1,229 @@
 package websocket
 
 import (
-	"context"
 	"encoding/json"
+	"sync"
+	"sync/atomic"
 
 	"github.com/google/uuid"
 	"github.com/lalith-99/echostream/internal/presence"
 	"go.uber.org/zap"
 )
 
-type subscription struct {
-	client    *Client
-	channelID uuid.UUID
+const maxSubscriptions = 64
+
+type command struct {
+	client  *Client
+	channel uuid.UUID
+	kind    string
 }
 
-type typingEvent struct {
-	channelID uuid.UUID
-	userID    uuid.UUID
+type frame struct {
+	channel uuid.UUID // nonzero frames require a fresh membership check before delivery
+	data    []byte
 }
 
-type broadcastMessage struct {
-	channelID uuid.UUID
-	data      []byte
-}
-
-// Hub maintains active clients and routes messages between them.
-// All state is managed in the Run goroutine — no locks needed.
 type Hub struct {
-	// channelID → set of subscribed clients
-	channels map[uuid.UUID]map[*Client]struct{}
-	// client → set of channels they're in
-	clientChannels map[*Client]map[uuid.UUID]struct{}
-
-	register      chan *Client
-	unregister    chan *Client
-	subscribeCh   chan *subscription
-	unsubscribeCh chan *subscription
-	broadcastCh   chan *broadcastMessage
-	typingCh      chan *typingEvent
-	shutdown      chan struct{}
-
-	// Called when a channel gets its first local subscriber.
-	onChannelActive func(channelID uuid.UUID)
-	// Called when a channel loses its last local subscriber.
-	onChannelInactive func(channelID uuid.UUID)
-
-	presence  *presence.Tracker              // nil until SetPresenceTracker is called
-	userConns map[uuid.UUID]int              // open WS conns per userID
-	cancelKA  map[*Client]context.CancelFunc // per-client keepalive cancel
-
-	logger *zap.Logger
+	channels        map[uuid.UUID]map[*Client]struct{}
+	clients         map[*Client]map[uuid.UUID]struct{}
+	register        chan *Client
+	unregister      chan *Client
+	commands        chan command
+	broadcast       chan frame
+	resync          chan struct{}
+	stop            chan struct{}
+	done            chan struct{}
+	stopOnce        sync.Once
+	active          atomic.Int64
+	presence        *presence.Tracker
+	presenceWorkers sync.WaitGroup
+	logger          *zap.Logger
 }
 
-// NewHub creates a Hub for managing websocket clients.
 func NewHub(logger *zap.Logger) *Hub {
 	return &Hub{
-		channels:       make(map[uuid.UUID]map[*Client]struct{}),
-		clientChannels: make(map[*Client]map[uuid.UUID]struct{}),
-		register:       make(chan *Client),
-		unregister:     make(chan *Client),
-		subscribeCh:    make(chan *subscription),
-		unsubscribeCh:  make(chan *subscription),
-		broadcastCh:    make(chan *broadcastMessage, 256),
-		typingCh:       make(chan *typingEvent, 256),
-		shutdown:       make(chan struct{}),
-		userConns:      make(map[uuid.UUID]int),
-		cancelKA:       make(map[*Client]context.CancelFunc),
-		logger:         logger,
+		logger:     logger,
+		channels:   make(map[uuid.UUID]map[*Client]struct{}),
+		clients:    make(map[*Client]map[uuid.UUID]struct{}),
+		register:   make(chan *Client),
+		unregister: make(chan *Client),
+		commands:   make(chan command),
+		broadcast:  make(chan frame, 256),
+		resync:     make(chan struct{}, 1),
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 }
 
-// SetChannelCallbacks wires the hub to Redis pub/sub.
-func (h *Hub) SetChannelCallbacks(onActive, onInactive func(uuid.UUID)) {
-	h.onChannelActive = onActive
-	h.onChannelInactive = onInactive
+// Call before Run.
+func (h *Hub) SetPresenceTracker(t *presence.Tracker) { h.presence = t }
+func (h *Hub) ConnectionCount() int64                 { return h.active.Load() }
+
+func (h *Hub) Register(c *Client) bool {
+	select {
+	case <-h.stop:
+		return false
+	case h.register <- c:
+		return true
+	}
 }
 
-// SetPresenceTracker enables online/offline tracking via Redis.
-func (h *Hub) SetPresenceTracker(t *presence.Tracker) {
-	h.presence = t
+func (h *Hub) Unregister(c *Client) {
+	select {
+	case <-h.stop:
+	case h.unregister <- c:
+	}
 }
 
-// Register queues a new client for the hub to track.
-func (h *Hub) Register(client *Client) {
-	h.register <- client
+func (h *Hub) apply(c *Client, kind string, channel uuid.UUID) {
+	select {
+	case <-h.stop:
+	case <-c.ctx.Done():
+	case h.commands <- command{client: c, kind: kind, channel: channel}:
+	}
 }
 
-// Broadcast sends data to all local clients in a channel.
-// Safe to call from any goroutine (e.g., the Redis listener).
-func (h *Hub) Broadcast(channelID uuid.UUID, data []byte) {
-	h.broadcastCh <- &broadcastMessage{channelID: channelID, data: data}
+func (h *Hub) Broadcast(channel uuid.UUID, data []byte) {
+	select {
+	case <-h.stop:
+	case h.broadcast <- frame{channel: channel, data: data}:
+	}
 }
 
-// Shutdown signals the hub to stop processing events.
+// A Redis reconnect may have missed publications. Every open subscriber
+// needs to fetch its durable history, even when no newer frame arrives.
+func (h *Hub) Resync() {
+	select {
+	case h.resync <- struct{}{}:
+	default:
+	}
+}
+
 func (h *Hub) Shutdown() {
-	close(h.shutdown)
+	h.stopOnce.Do(func() { close(h.stop) })
+	<-h.done
 }
 
-// Run is the hub's main event loop. Must be started as a goroutine.
 func (h *Hub) Run() {
+	defer close(h.done)
 	for {
 		select {
-		case <-h.shutdown:
-			h.logger.Info("hub shutting down")
+		case <-h.stop:
+			h.logger.Info("closing websocket sessions", zap.Int("clients", len(h.clients)))
+			for c := range h.clients {
+				c.stop()
+			}
+			for c := range h.clients {
+				if c.pumpsDone != nil {
+					<-c.pumpsDone
+				}
+			}
+			h.active.Store(0)
+			h.presenceWorkers.Wait()
 			return
-		case client := <-h.register:
-			h.clientChannels[client] = make(map[uuid.UUID]struct{})
-			h.userConns[client.userID]++
-
-			// Start presence tracking for this connection
+		case c := <-h.register:
+			h.clients[c] = make(map[uuid.UUID]struct{})
+			h.active.Add(1)
 			if h.presence != nil {
-				ctx, cancel := context.WithCancel(context.Background())
-				h.cancelKA[client] = cancel
-				h.presence.SetOnline(ctx, client.userID)
-				go h.presence.KeepAlive(ctx, client.userID)
+				h.presenceWorkers.Add(1)
+				go func() { defer h.presenceWorkers.Done(); h.presence.Track(c.ctx, c.userID) }()
 			}
-
-			h.logger.Debug("client connected",
-				zap.String("user_id", client.userID.String()),
-			)
-
-		case client := <-h.unregister:
-			if channels, ok := h.clientChannels[client]; ok {
-				for chID := range channels {
-					h.removeFromChannel(client, chID)
+		case c := <-h.unregister:
+			if subscribed, ok := h.clients[c]; ok {
+				c.stop()
+				for channel := range subscribed {
+					h.remove(c, channel)
 				}
-				delete(h.clientChannels, client)
-				close(client.send)
+				delete(h.clients, c)
+				h.active.Add(-1)
 			}
-
-			// Stop this client's keepalive goroutine
-			if cancel, ok := h.cancelKA[client]; ok {
-				cancel()
-				delete(h.cancelKA, client)
+		case cmd := <-h.commands:
+			h.process(cmd)
+		case f := <-h.broadcast:
+			for c := range h.channels[f.channel] {
+				c.enqueue(f)
 			}
-
-			// Only set offline when last connection for this user closes
-			h.userConns[client.userID]--
-			if h.userConns[client.userID] <= 0 {
-				delete(h.userConns, client.userID)
-				if h.presence != nil {
-					h.presence.SetOffline(context.Background(), client.userID)
-				}
-			}
-
-			h.logger.Debug("client disconnected",
-				zap.String("user_id", client.userID.String()),
-			)
-
-		case sub := <-h.subscribeCh:
-			h.addToChannel(sub.client, sub.channelID)
-			data, err := json.Marshal(OutboundEvent{Type: "subscribed", ChannelID: sub.channelID.String()})
-			if err != nil {
-				h.logger.Error("failed to marshal subscribed event", zap.Error(err))
-			} else {
-				sub.client.Send(data)
-			}
-			// Notify other channel subscribers that this user is online
-			h.broadcastPresence(sub.channelID, sub.client.userID, "online")
-			h.logger.Debug("client subscribed to channel",
-				zap.String("user_id", sub.client.userID.String()),
-				zap.String("channel_id", sub.channelID.String()),
-			)
-
-		case sub := <-h.unsubscribeCh:
-			h.removeFromChannel(sub.client, sub.channelID)
-			data, err := json.Marshal(OutboundEvent{Type: "unsubscribed", ChannelID: sub.channelID.String()})
-			if err != nil {
-				h.logger.Error("failed to marshal unsubscribed event", zap.Error(err))
-			} else {
-				sub.client.Send(data)
-			}
-
-		case msg := <-h.broadcastCh:
-			if clients, ok := h.channels[msg.channelID]; ok {
-				for client := range clients {
-					client.Send(msg.data)
-				}
-			}
-
-		case ev := <-h.typingCh:
-			if clients, ok := h.channels[ev.channelID]; ok {
-				event := OutboundEvent{
-					Type:      "typing",
-					ChannelID: ev.channelID.String(),
-					UserID:    ev.userID.String(),
-				}
-				data, err := json.Marshal(event)
-				if err != nil {
-					h.logger.Error("failed to marshal typing event", zap.Error(err))
-					continue
-				}
-				for client := range clients {
-					if client.userID != ev.userID {
-						client.Send(data)
-					}
+		case <-h.resync:
+			for channel, clients := range h.channels {
+				f := eventFrame("resync", channel, uuid.Nil, true)
+				for c := range clients {
+					c.enqueue(f)
 				}
 			}
 		}
 	}
 }
 
-func (h *Hub) addToChannel(client *Client, channelID uuid.UUID) {
-	if _, ok := h.channels[channelID]; !ok {
-		h.channels[channelID] = make(map[*Client]struct{})
-		if h.onChannelActive != nil {
-			h.onChannelActive(channelID)
-		}
+func eventFrame(kind string, channel, user uuid.UUID, check bool) frame {
+	ev := OutboundEvent{Type: kind, ChannelID: channel.String()}
+	if user != uuid.Nil {
+		ev.UserID = user.String()
 	}
-	h.channels[channelID][client] = struct{}{}
-	h.clientChannels[client][channelID] = struct{}{}
+	payload, _ := json.Marshal(ev) // fields populated above are all strings
+	f := frame{data: payload}
+	if check {
+		f.channel = channel
+	}
+	return f
 }
 
-func (h *Hub) removeFromChannel(client *Client, channelID uuid.UUID) {
-	if clients, ok := h.channels[channelID]; ok {
-		delete(clients, client)
-		// Notify remaining subscribers that this user went offline —
-		// but only if this is the user's last connection in the channel.
-		stillHere := false
-		for c := range clients {
-			if c.userID == client.userID {
-				stillHere = true
-				break
-			}
-		}
-		if !stillHere && len(clients) > 0 {
-			h.broadcastPresence(channelID, client.userID, "offline")
-		}
-		if len(clients) == 0 {
-			delete(h.channels, channelID)
-			if h.onChannelInactive != nil {
-				h.onChannelInactive(channelID)
-			}
-		}
-	}
-	if channels, ok := h.clientChannels[client]; ok {
-		delete(channels, channelID)
-	}
-}
-
-// broadcastPresence sends a presence_change event to all subscribers of a
-// channel, excluding the user whose status changed.
-func (h *Hub) broadcastPresence(channelID, userID uuid.UUID, status string) {
-	clients, ok := h.channels[channelID]
-	if !ok {
+func (h *Hub) process(cmd command) {
+	c, id := cmd.client, cmd.channel
+	subs, registered := h.clients[c]
+	if !registered {
 		return
 	}
-	event := OutboundEvent{
-		Type:      "presence_change",
-		ChannelID: channelID.String(),
-		UserID:    userID.String(),
-		Status:    status,
+	_, subscribed := subs[id]
+	switch cmd.kind {
+	case "subscribe":
+		if !subscribed && len(subs) >= maxSubscriptions {
+			c.sendError("channel subscription limit reached")
+			return
+		}
+		if !subscribed {
+			if h.channels[id] == nil {
+				h.channels[id] = make(map[*Client]struct{})
+			}
+			subs[id] = struct{}{}
+			h.channels[id][c] = struct{}{}
+		}
+		c.enqueue(eventFrame("subscribed", id, uuid.Nil, false))
+		if !subscribed {
+			h.notifyPeers(c, id, "presence_refresh")
+		}
+	case "unsubscribe":
+		h.remove(c, id)
+		c.enqueue(eventFrame("unsubscribed", id, uuid.Nil, false))
+	case "revoked":
+		if subscribed {
+			h.remove(c, id)
+			c.enqueue(eventFrame("unsubscribed", id, uuid.Nil, false))
+		}
+	case "typing":
+		if subscribed {
+			h.notifyPeers(c, id, "typing")
+		}
 	}
-	data, err := json.Marshal(event)
-	if err != nil {
-		h.logger.Error("failed to marshal presence event", zap.Error(err))
+}
+
+func (h *Hub) notifyPeers(sender *Client, channel uuid.UUID, kind string) {
+	f := eventFrame(kind, channel, sender.userID, true)
+	for peer := range h.channels[channel] {
+		if peer.userID != sender.userID {
+			peer.enqueue(f)
+		}
+	}
+}
+
+func (h *Hub) remove(c *Client, id uuid.UUID) {
+	if _, ok := h.clients[c][id]; !ok {
 		return
 	}
-	for client := range clients {
-		if client.userID != userID {
-			client.Send(data)
-		}
+	delete(h.clients[c], id)
+	delete(h.channels[id], c)
+	if len(h.channels[id]) == 0 {
+		delete(h.channels, id)
+	} else {
+		h.notifyPeers(c, id, "presence_refresh")
 	}
 }

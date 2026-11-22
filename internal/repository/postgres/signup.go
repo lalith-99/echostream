@@ -2,10 +2,13 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lalith-99/echostream/internal/models"
+	"github.com/lalith-99/echostream/internal/repository"
 )
 
 // SignupStore implements repository.SignupRepository.
@@ -50,9 +53,13 @@ func (s *SignupStore) CreateTenantAndUser(
 	err = tx.QueryRow(ctx,
 		`INSERT INTO users (tenant_id, email, display_name, password_hash, created_at)
 		 VALUES ($1, $2, $3, $4, now())
+		ON CONFLICT (email) DO NOTHING
 		 RETURNING id, tenant_id, email, display_name, password_hash, created_at`,
 		tenant.ID, email, displayName, passwordHash,
 	).Scan(&user.ID, &user.TenantID, &user.Email, &user.DisplayName, &user.PasswordHash, &user.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, repository.ErrEmailRegistered
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("insert user: %w", err)
 	}

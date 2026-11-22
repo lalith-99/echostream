@@ -50,7 +50,8 @@ export type OutboundEventType =
   | 'typing'
   | 'subscribed'
   | 'unsubscribed'
-  | 'presence_change'
+  | 'presence_refresh'
+  | 'resync'
   | 'error';
 
 export interface OutboundEvent {

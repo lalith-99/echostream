@@ -18,7 +18,7 @@ type DB struct {
 func New(ctx context.Context, databaseURL string, logger *zap.Logger) (*DB, error) {
 	poolConfig, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse pool config: %w", err)
+		return nil, fmt.Errorf("invalid database connection configuration")
 	}
 
 	// Pool tuning
@@ -40,7 +40,7 @@ func New(ctx context.Context, databaseURL string, logger *zap.Logger) (*DB, erro
 	}
 
 	logger.Info("DB connection established",
-		zap.String("dsn", poolConfig.ConnString()),
+		zap.String("database", poolConfig.ConnConfig.Database),
 		zap.Int32("max_conns", poolConfig.MaxConns),
 	)
 	return &DB{

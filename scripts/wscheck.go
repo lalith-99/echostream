@@ -1,15 +1,15 @@
 //go:build ignore
 
+// Run go run ./scripts/wscheck.go against the local development API.
 package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
-	"net/url"
 	"os"
 	"time"
 
@@ -18,169 +18,115 @@ import (
 
 const base = "http://localhost:8081"
 
-func main() {
-	suffix := rand.Intn(1_000_000)
+var client = http.Client{Timeout: 5 * time.Second}
 
-	fmt.Println("=== Step 1: Signup Alice ===")
-	email := fmt.Sprintf("alice+%d@test.com", suffix)
-	aliceToken := signup(email, "pass1234", "Alice", "TestCorp")
-	fmt.Println("  token:", aliceToken[:30], "...")
-
-	fmt.Println("\n=== Step 2: Create #general ===")
-	channelID := createChannel(aliceToken, fmt.Sprintf("ws-test-%d", suffix), "Testing WS delivery")
-	fmt.Println("  channel:", channelID)
-
-	fmt.Println("\n=== Step 3: Alice joins #general ===")
-	joinChannel(aliceToken, channelID)
-	fmt.Println("  joined")
-
-	fmt.Println("\n=== Step 4: Connect WebSocket ===")
-	wsURL := url.URL{
-		Scheme:   "ws",
-		Host:     "localhost:8081",
-		Path:     "/v1/ws",
-		RawQuery: "token=" + aliceToken,
-	}
-	conn, _, err := gorillaws.DefaultDialer.Dial(wsURL.String(), nil)
-	if err != nil {
-		fatal("ws dial", err)
-	}
-	defer conn.Close()
-	fmt.Println("  connected")
-
-	wsMsgs := make(chan map[string]interface{}, 10)
-	go func() {
-		for {
-			_, raw, err := conn.ReadMessage()
-			if err != nil {
-				return
-			}
-			var msg map[string]interface{}
-			json.Unmarshal(raw, &msg)
-			wsMsgs <- msg
-		}
-	}()
-
-	fmt.Println("\n=== Step 5: Subscribe via WS ===")
-	conn.WriteJSON(map[string]string{
-		"type":       "subscribe",
-		"channel_id": channelID,
-	})
-
-	select {
-	case msg := <-wsMsgs:
-		fmt.Printf("  got: %v\n", msg["type"])
-	case <-time.After(3 * time.Second):
-		fatal("timeout", fmt.Errorf("no subscribe ack"))
-	}
-
-	fmt.Println("\n=== Step 6: Send message via REST ===")
-	restMsg := sendMessage(aliceToken, channelID, "Hello from REST!")
-	fmt.Printf("  saved: id=%v body=%v\n", restMsg["id"], restMsg["body"])
-
-	fmt.Println("\n=== Step 7: Check WebSocket delivery ===")
-	select {
-	case msg := <-wsMsgs:
-		if msg["type"] == "message" {
-			inner := msg["message"].(map[string]interface{})
-			fmt.Println("  REAL-TIME DELIVERY WORKS")
-			fmt.Printf("  body: %s\n", inner["body"])
-		}
-	case <-time.After(3 * time.Second):
-		fmt.Println("  TIMEOUT - no message on WebSocket")
-		os.Exit(1)
-	}
-
-	fmt.Println("\n=== Step 8: Rapid fire 3 messages ===")
-	for i := 1; i <= 3; i++ {
-		sendMessage(aliceToken, channelID, fmt.Sprintf("Message #%d", i))
-	}
-	count := 0
-	deadline := time.After(3 * time.Second)
-loop:
-	for count < 3 {
-		select {
-		case <-wsMsgs:
-			count++
-		case <-deadline:
-			break loop
-		}
-	}
-	fmt.Printf("  received %d/3 via WebSocket\n", count)
-
-	fmt.Println("\n=== Step 9: Check message history ===")
-	messages := listMessages(aliceToken, channelID)
-	fmt.Printf("  %d messages in DB\n", len(messages))
-
-	fmt.Println("\nAll tests passed.")
+type message struct {
+	ID   int64  `json:"id"`
+	Body string `json:"body"`
 }
 
-func signup(email, password, name, tenant string) string {
-	body, _ := json.Marshal(map[string]string{
-		"email": email, "password": password,
-		"display_name": name, "tenant_name": tenant,
-	})
-	resp := post("/v1/auth/signup", "", body)
-	return resp["token"].(string)
-}
-
-func createChannel(token, name, desc string) string {
-	body, _ := json.Marshal(map[string]string{"name": name, "description": desc})
-	resp := post("/v1/channels", token, body)
-	return resp["id"].(string)
-}
-
-func joinChannel(token, channelID string) {
-	post("/v1/channels/"+channelID+"/join", token, nil)
-}
-
-func sendMessage(token, channelID, content string) map[string]interface{} {
-	body, _ := json.Marshal(map[string]string{"content": content})
-	return post("/v1/channels/"+channelID+"/messages", token, body)
-}
-
-func listMessages(token, channelID string) []interface{} {
-	req, _ := http.NewRequest("GET", base+"/v1/channels/"+channelID+"/messages", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		fatal("list", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	var out []interface{}
-	json.Unmarshal(raw, &out)
-	return out
-}
-
-func post(path, token string, body []byte) map[string]interface{} {
-	var r io.Reader
+func request(method, path, token string, body, result any) error {
+	var payload io.Reader
 	if body != nil {
-		r = bytes.NewReader(body)
+		data, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		payload = bytes.NewReader(data)
 	}
-	req, _ := http.NewRequest("POST", base+path, r)
+	req, err := http.NewRequest(method, base+path, payload)
+	if err != nil {
+		return err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		fatal("POST "+path, err)
+		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 && resp.StatusCode != 204 {
-		fatal("POST "+path, fmt.Errorf("status %d: %s", resp.StatusCode, string(raw)))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("%s %s: %s", method, path, resp.Status)
 	}
-	if resp.StatusCode == 204 || len(raw) == 0 {
-		return nil
-	}
-	var out map[string]interface{}
-	json.Unmarshal(raw, &out)
-	return out
+	return json.NewDecoder(resp.Body).Decode(result)
 }
 
-func fatal(ctx string, err error) {
-	fmt.Fprintf(os.Stderr, "FAIL [%s]: %v\n", ctx, err)
-	os.Exit(1)
+func check() error {
+	var session struct {
+		Token string `json:"token"`
+	}
+	err := request(http.MethodPost, "/v1/auth/signup", "", map[string]string{
+		"email": rand.Text() + "@example.com", "password": rand.Text(), "display_name": "WS check", "tenant_name": "Local demo",
+	}, &session)
+	if err != nil {
+		return err
+	}
+	var channel struct {
+		ID string `json:"id"`
+	}
+	if err := request(http.MethodPost, "/v1/channels", session.Token, map[string]string{"name": "demo"}, &channel); err != nil {
+		return err
+	}
+
+	conn, _, err := gorillaws.DefaultDialer.Dial("ws://localhost:8081/v1/ws", http.Header{"Authorization": {"Bearer " + session.Token}})
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]string{"type": "subscribe", "channel_id": channel.ID}); err != nil {
+		return err
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var ack struct {
+		Type    string
+		Channel string `json:"channel_id"`
+	}
+	if err := conn.ReadJSON(&ack); err != nil {
+		return err
+	}
+	if ack.Type != "subscribed" || ack.Channel != channel.ID {
+		return fmt.Errorf("channel subscription was not acknowledged")
+	}
+
+	path := "/v1/channels/" + channel.ID + "/messages"
+	var saved message
+	if err := request(http.MethodPost, path, session.Token, map[string]string{"content": "Hello from REST"}, &saved); err != nil {
+		return err
+	}
+	if saved.ID <= 0 {
+		return fmt.Errorf("message ID missing")
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		var event struct {
+			Type    string
+			Message message
+		}
+		if err := conn.ReadJSON(&event); err != nil {
+			return err
+		}
+		if event.Type == "message" {
+			if event.Message != saved {
+				return fmt.Errorf("live message differed from stored response")
+			}
+			break
+		}
+	}
+	var history []message
+	if err := request(http.MethodGet, path, session.Token, nil, &history); err != nil {
+		return err
+	}
+	if len(history) != 1 || history[0] != saved {
+		return fmt.Errorf("unexpected channel history")
+	}
+	fmt.Printf("Message %d matched the send response, live event and channel history.\n", saved.ID)
+	return nil
+}
+func main() {
+	if err := check(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }

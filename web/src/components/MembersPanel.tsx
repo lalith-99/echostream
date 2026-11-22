@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Users, X } from 'lucide-react';
 import { echostream } from '../lib/api';
 import type { MemberPresence, OutboundEvent, User } from '../lib/types';
@@ -27,32 +27,32 @@ interface Props {
 export function MembersPanel({ channelId, usersById, myUserId, onWsEvent }: Props) {
   const [open, setOpen] = useState(false);
 
-  const { data: members = [] } = useQuery<MemberPresence[]>({
+  const queryClient = useQueryClient();
+  const [invitee, setInvitee] = useState('');
+  const invite = useMutation({
+    mutationFn: (userId: string) => echostream.inviteToChannel(channelId, userId),
+    onSuccess: () => {
+      setInvitee('');
+      void queryClient.invalidateQueries({ queryKey: ['presence', channelId] });
+    },
+  });
+  const { data: members = [], isLoading, isError } = useQuery<MemberPresence[]>({
     queryKey: ['presence', channelId],
-    queryFn: () => echostream.getChannelPresence(channelId),
+    queryFn: ({ signal }) => echostream.getChannelPresence(channelId, signal),
     enabled: open,
     refetchInterval: open ? 30_000 : false,
   });
 
-  // Keep presence up-to-date from live WS events without a refetch.
-  const [overrides, setOverrides] = useState<Map<string, 'online' | 'offline'>>(new Map());
-  useEffect(() => {
-    const unsub = onWsEvent((ev) => {
-      if (ev.type === 'presence_change' && ev.user_id) {
-        setOverrides((prev) =>
-          new Map(prev).set(ev.user_id!, ev.status as 'online' | 'offline'),
-        );
-      }
-    });
-    return unsub;
-  }, [onWsEvent]);
-
-  const online = members.filter(
-    (m) => (overrides.get(m.user_id) ?? m.status) === 'online',
-  );
-  const offline = members.filter(
-    (m) => (overrides.get(m.user_id) ?? m.status) === 'offline',
-  );
+  useEffect(() => onWsEvent((event) => {
+    if (open && event.channel_id === channelId &&
+        (event.type === 'presence_refresh' || event.type === 'subscribed')) {
+      void queryClient.invalidateQueries({ queryKey: ['presence', channelId] });
+    }
+  }), [channelId, open, onWsEvent, queryClient]);
+  const online = members.filter((member) => member.status === 'online');
+  const offline = members.filter((member) => member.status === 'offline');
+  const memberIds = new Set(members.map((member) => member.user_id));
+  const candidates = Array.from(usersById.values()).filter((user) => !memberIds.has(user.id));
 
   function displayName(userId: string) {
     if (userId === myUserId) return 'You';
@@ -120,10 +120,24 @@ export function MembersPanel({ channelId, usersById, myUserId, onWsEvent }: Prop
                 ))}
               </>
             )}
-            {members.length === 0 && (
+            {isLoading && <p className="px-2 text-xs text-slate-500">Loading members…</p>}
+            {isError && <p role="alert" className="px-2 text-xs text-red-500">Could not load members.</p>}
+            {!isLoading && !isError && members.length === 0 && (
               <p className="px-2 py-3 text-center text-xs text-slate-400">No members yet</p>
             )}
           </div>
+          {!isLoading && !isError && candidates.length > 0 && (
+            <form className="space-y-2 border-t border-slate-200 p-2 text-xs"
+              onSubmit={(e) => { e.preventDefault(); if (invitee) invite.mutate(invitee); }}>
+              <select aria-label="Workspace member" value={invitee}
+                onChange={(e) => setInvitee(e.target.value)} className="w-full rounded border p-1 dark:bg-slate-900">
+                <option value="">Select a workspace member</option>
+                {candidates.map((u) => <option key={u.id} value={u.id}>{u.display_name}</option>)}
+              </select>
+              <button disabled={!invitee || invite.isPending} className="text-indigo-600 disabled:opacity-50">Add to channel</button>
+              {invite.error && <p role="alert" className="text-red-500">{invite.error.message}</p>}
+            </form>
+          )}
         </div>
       )}
     </div>

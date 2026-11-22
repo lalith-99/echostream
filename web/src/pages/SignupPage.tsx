@@ -1,8 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { MessageSquare } from 'lucide-react';
 import { echostream } from '../lib/api';
 import { ApiError } from '../lib/apiClient';
@@ -16,15 +16,25 @@ const schema = z
     display_name: z.string().min(1, 'Display name is required'),
     email: z.string().email('Enter a valid email'),
     password: z.string().min(8, 'Password must be at least 8 characters'),
-  })
-  .refine((d) => d.tenant_name || true, {}); // tenant_name validated server-side
+  });
 
 type FormValues = z.infer<typeof schema>;
 
 export function SignupPage() {
   const navigate = useNavigate();
-  const [params] = useSearchParams();
-  const inviteToken = params.get('invite') ?? '';
+  const [inviteToken] = useState(() => {
+    const url = new URL(window.location.href);
+    return new URLSearchParams(url.hash.slice(1)).get('invite') ?? url.searchParams.get('invite') ?? '';
+  });
+  useEffect(() => {
+    if (!inviteToken) return;
+    const url = new URL(window.location.href);
+    const fragment = new URLSearchParams(url.hash.slice(1));
+    fragment.delete('invite');
+    url.hash = fragment.toString();
+    url.searchParams.delete('invite');
+    window.history.replaceState(window.history.state, '', url);
+  }, [inviteToken]);
   const hasInvite = inviteToken !== '';
 
   const setToken = useAuthStore((s) => s.setToken);
@@ -38,6 +48,10 @@ export function SignupPage() {
 
   async function onSubmit(values: FormValues) {
     setFormError(null);
+    if (!hasInvite && !values.tenant_name?.trim()) {
+      setFormError('Enter a workspace name.');
+      return;
+    }
     try {
       const { token } = await echostream.signup({
         ...values,
