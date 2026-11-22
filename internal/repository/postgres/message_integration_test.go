@@ -169,7 +169,7 @@ func TestPostgresMessageOutbox(t *testing.T) {
 	// Redis may have accepted a publish just as the process loses its DB session.
 	// Retain the same durable ID for the next delivery attempt.
 	lost, stopPublish := context.WithCancel(ctx)
-	_, err := store.DispatchNext(lost, func(_ context.Context, m *models.Message) error {
+	_, err = store.DispatchNext(lost, func(_ context.Context, m *models.Message) error {
 		stopPublish()
 		return nil
 	})
