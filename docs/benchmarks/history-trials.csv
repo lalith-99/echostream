@@ -1,0 +1,13 @@
+condition,variant,samples,clients,duration_s,pages_s,p50_ms,p95_ms,p99_ms,allocated_bytes_page,mallocs_page
+direct loopback,baseline,65536,32,8.786,7459.5,4.136,6.539,8.019,19722,329.4
+direct loopback,candidate,65536,32,8.052,8139.5,3.825,5.850,6.948,10690,202.3
+direct loopback,candidate,65536,32,8.180,8011.6,3.899,5.888,6.943,10690,202.3
+direct loopback,baseline,65536,32,8.537,7676.5,4.056,6.215,7.271,19721,329.4
+direct loopback,baseline,65536,32,8.521,7690.9,4.036,6.175,7.166,19721,329.3
+direct loopback,candidate,65536,32,8.473,7734.8,3.981,6.248,7.592,10690,202.3
+2 ms database egress delay,baseline,65536,32,23.244,2819.5,10.959,14.360,15.724,19722,329.4
+2 ms database egress delay,candidate,65536,32,23.068,2840.9,10.777,14.385,15.657,10691,202.3
+2 ms database egress delay,candidate,65536,32,22.989,2850.7,10.508,14.868,16.029,10692,202.3
+2 ms database egress delay,baseline,65536,32,23.121,2834.5,10.893,14.621,15.856,19722,329.4
+2 ms database egress delay,baseline,65536,32,23.111,2835.7,11.069,13.869,15.207,19722,329.4
+2 ms database egress delay,candidate,65536,32,22.989,2850.7,10.308,15.362,15.998,10692,202.3
