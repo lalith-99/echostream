@@ -1,96 +1,41 @@
 # EchoStream Web
 
-React + TypeScript frontend for the [EchoStream](../README.md) real-time chat backend.
+The React and TypeScript client uses REST for sign-in, channel membership and durable message history. A WebSocket carries live updates for the selected channel. The [main README](../README.md) describes the backend and deployment.
 
-## Tech stack
+## Run the app
 
-| Layer | Technology |
-|---|---|
-| Framework | React 19 + TypeScript |
-| Build tool | Vite |
-| Styling | Tailwind CSS v4 |
-| Server state | TanStack Query |
-| Client state | Zustand |
-| Routing | React Router v7 |
-| Forms | React Hook Form + Zod |
-| Icons | lucide-react |
+From the repository root, run `make up` and open `http://localhost:5173`. The web container proxies both REST and WebSocket requests to the API. Use two separate tabs to try two accounts. Create a workspace in the first tab, select **Invite to workspace**, and open the link in the second tab.
 
-## Features
+For frontend development, start the backend and its dependencies, then run these commands in `web/` with Node.js 22.13 or newer.
 
-- **Auth** — signup (creates workspace) / login, JWT-backed session with auto-logout on expiry
-- **Workspace invites** — generate an invite link; second user joins the same workspace without a separate signup tenant
-- **Channel list** — public channels visible to all; private channels only shown to members
-- **Real-time messaging** — WebSocket delivery with exponential-backoff reconnection and per-channel subscribe/unsubscribe
-- **Message history** — cursor-paginated fetch with "Load older messages" support
-- **WS status indicator** — live connection state (connecting / connected / disconnected) in the channel header
-
-## Getting started
-
-Use Node.js 22 and npm. Run these commands from the `web` directory:
-
-```bash
-# 1. Install dependencies
+```sh
 npm ci
-
-# 2. Configure API endpoints (defaults point to the local backend on :8081)
-cp .env.example .env
-
-# 3. Start the dev server → http://localhost:5173
 npm run dev
 ```
 
-The backend must be running at `VITE_API_BASE_URL` (default `http://localhost:8081`). Start it from the repo root:
+Vite connects to `http://localhost:8081` by default. Production builds use the web origin and select `wss` on HTTPS. Set `VITE_API_BASE_URL` or `VITE_WS_BASE_URL` at build time for a separate API origin. Configure that origin's backend CORS and WebSocket allowlists for the browser's origin.
 
-```bash
-docker compose up -d --wait postgres redis
-make run
-```
+## Message delivery
 
-For a containerized frontend instead of Vite, run this from the repository root:
+- The client joins a public channel before it requests history or subscribes. A private channel appears for its members. The members panel can add another workspace member to the channel.
+- Each draft gets a UUID for its send request. Retrying the same draft after a lost response reuses its key while that composer stays open.
+- The saved HTTP response appears immediately. A duplicate live event or an overlapping history page resolves to the same message ID.
+- On subscription, Redis resynchronization, browser network recovery and every 30 seconds, the active channel checks PostgreSQL-backed history. The forward cursor advances only through completed history reads. The live view retains 300 messages. Earlier history loads one 50-message page at a time and has a direct return to the live view.
+- Workspace data and channel selection belong to the signed-in session. A new account starts with a fresh query cache. The tab stores the session token in session storage.
 
-```bash
-docker compose --profile full up -d --build --wait
-```
+## Checks
 
-Open `http://localhost:5173`. The Go backend must still run separately with `make run`; this
-Compose profile starts the frontend and database/cache dependencies, not the backend. The
-frontend port matches the backend's default CORS allowlist and workspace invite URL. Stop the
-Vite server before starting this profile because both use port 5173.
-
-Create a workspace invite to add another account to an existing workspace. A new signup without
-an invite creates a separate workspace. See the root README's [current limitations](../README.md#current-limitations)
-for the private-channel authorization and multi-instance presence gaps.
-
-## Scripts
-
-| Command | Description |
+| Command | What it covers |
 |---|---|
-| `npm run dev` | Dev server with hot-reload |
-| `npm run build` | Typecheck (`tsc`) + production build → `dist/` |
-| `npm run typecheck` | Type-check only |
-| `npm run lint` | ESLint |
-| `npm run format` | Prettier |
+| `npm test` | Duplicate and out-of-order delivery, multipage recovery, partial failure, bounded live history and channel cancellation |
+| `npm run test:browser` | Two Chromium sessions create and join a workspace, retry a committed send after its response is lost, verify live delivery, disconnect a reader and recover the missed message from history |
+| `npm run lint` | ESLint and React Hooks checks |
+| `npm run build` | TypeScript validation and optimized assets in `dist/` |
 
-## Project structure
-
-```
-src/
-  lib/          # API client, typed endpoint functions, env config, shared types
-  store/        # Zustand stores (auth, active channel)
-  hooks/        # useWebSocket — connection lifecycle + reconnect logic
-  routes/       # Router config + ProtectedRoute guard
-  pages/        # LoginPage, SignupPage, ChatPage
-  components/   # Sidebar, MessagePane, CreateChannelModal, reusable UI
-```
-
-## Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `VITE_API_BASE_URL` | `http://localhost:8081` | EchoStream REST API base URL |
-| `VITE_WS_BASE_URL` | `ws://localhost:8081` | EchoStream WebSocket base URL |
-
-## Architecture
-
-See [../README.md](../README.md) and [../docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) for the full system design, including the real-time fan-out path (REST → Postgres → Redis pub/sub → WebSocket hub → browser).
-
+The browser check runs against the assembled stack. After `make up`, run
+`npx playwright-core install chromium` and `npm run test:browser` from
+`web/`. To use an installed Chrome executable, set `CHROME_PATH` to its path.
+The default target is `http://localhost:5173`. For another test instance,
+set both `ECHO_BROWSER_URL` and the API's `FRONTEND_BASE_URL` to the web
+origin, and include it in `CORS_ALLOWED_ORIGINS`. Each run creates an isolated
+test workspace and two accounts.

@@ -8,18 +8,20 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/lalith-99/echostream/internal/invite"
 	"github.com/lalith-99/echostream/internal/middleware"
+	"github.com/lalith-99/echostream/internal/repository"
 	"go.uber.org/zap"
 )
 
 // WorkspaceHandler handles workspace-level operations.
 type WorkspaceHandler struct {
 	inviteSvc *invite.Service
+	users     repository.UserRepository
 	baseURL   string
 	logger    *zap.Logger
 }
 
-func NewWorkspaceHandler(inviteSvc *invite.Service, baseURL string, logger *zap.Logger) *WorkspaceHandler {
-	return &WorkspaceHandler{inviteSvc: inviteSvc, baseURL: baseURL, logger: logger}
+func NewWorkspaceHandler(inviteSvc *invite.Service, users repository.UserRepository, baseURL string, logger *zap.Logger) *WorkspaceHandler {
+	return &WorkspaceHandler{inviteSvc: inviteSvc, users: users, baseURL: baseURL, logger: logger}
 }
 
 type inviteResponse struct {
@@ -35,6 +37,16 @@ type inviteResponse struct {
 func (h *WorkspaceHandler) GenerateInvite(c *gin.Context) {
 	tenantID := middleware.GetTenantID(c)
 
+	user, err := h.users.GetByID(c.Request.Context(), tenantID, middleware.GetUserID(c))
+	if err != nil {
+		h.logger.Error("failed to check workspace membership", zap.Error(err))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate invite"})
+		return
+	}
+	if user == nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "workspace membership required"})
+		return
+	}
 	token, err := h.inviteSvc.Generate(c.Request.Context(), tenantID.String())
 	if err != nil {
 		h.logger.Error("failed to generate invite token", zap.Error(err))
@@ -42,9 +54,10 @@ func (h *WorkspaceHandler) GenerateInvite(c *gin.Context) {
 		return
 	}
 
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusCreated, inviteResponse{
 		Token:     token,
-		InviteURL: fmt.Sprintf("%s/signup?invite=%s", h.baseURL, token),
+		InviteURL: fmt.Sprintf("%s/signup#invite=%s", h.baseURL, token),
 		ExpiresAt: time.Now().Add(invite.TokenTTL),
 	})
 }

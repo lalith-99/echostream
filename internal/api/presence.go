@@ -50,30 +50,14 @@ type memberPresence struct {
 // GetChannelPresence handles GET /v1/channels/:id/presence
 //
 // Returns an array of members with their online/offline status.
-// Uses Redis MGET for a single round-trip regardless of member count.
+// Batches presence lookups for a bounded page of members.
 func (h *PresenceHandler) GetChannelPresence(c *gin.Context) {
-	channelID, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid channel id"})
-		return
-	}
-
-	tenantID := middleware.GetTenantID(c)
-
-	// Verify the channel exists and belongs to the caller's tenant.
-	ch, err := h.channels.GetByID(c.Request.Context(), tenantID, channelID)
-	if err != nil {
-		h.logger.Error("failed to get channel", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		return
-	}
+	ch := visibleChannel(c, h.channels, h.logger)
 	if ch == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "channel not found"})
 		return
 	}
-
-	// Fetch all members (use a generous limit — presence is lightweight).
-	members, err := h.membership.ListMembers(c.Request.Context(), channelID, 1000, 0)
+	limit, offset := parsePagination(c, 1000, 1000)
+	members, err := h.membership.ListMembers(c.Request.Context(), middleware.GetTenantID(c), ch.ID, middleware.GetUserID(c), limit, offset)
 	if err != nil {
 		h.logger.Error("failed to list members", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -92,6 +76,11 @@ func (h *PresenceHandler) GetChannelPresence(c *gin.Context) {
 	}
 
 	statuses := h.tracker.BulkStatus(c.Request.Context(), userIDs)
+
+	if statuses == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "presence temporarily unavailable"})
+		return
+	}
 
 	result := make([]memberPresence, len(members))
 	for i, m := range members {

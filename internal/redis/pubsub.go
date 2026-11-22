@@ -1,86 +1,105 @@
 package redis
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/lalith-99/echostream/internal/observ"
 	goredis "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
 
-// Broadcaster can send data to all local clients in a channel.
 type Broadcaster interface {
 	Broadcast(channelID uuid.UUID, data []byte)
+	Resync()
 }
 
-// PubSub bridges Redis pub/sub with the local WebSocket hub.
+// Each instance has one subscription, established before the HTTP server
+// starts. The hub routes each event exclusively to local channel subscribers.
 type PubSub struct {
-	client *Client
-	sub    *goredis.PubSub
-	hub    Broadcaster
-	logger *zap.Logger
+	sub *goredis.PubSub
+	hub Broadcaster
 }
 
-// NewPubSub creates a Redis pub/sub bridge for the local hub.
-func NewPubSub(client *Client, hub Broadcaster, logger *zap.Logger) *PubSub {
-	return &PubSub{
-		// Start with no channels; callers subscribe as channels become active.
-		sub:    client.rdb.Subscribe(context.Background()),
-		client: client,
-		hub:    hub,
-		logger: logger,
+func NewPubSub(client *Client, hub Broadcaster, logger *zap.Logger) (*PubSub, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sub := client.rdb.PSubscribe(ctx, "ch:*")
+	reply, err := sub.ReceiveTimeout(ctx, 5*time.Second)
+	if err != nil {
+		_ = sub.Close()
+		return nil, fmt.Errorf("wait for Redis subscription: %w", err)
 	}
+	ack, ok := reply.(*goredis.Subscription)
+	if !ok || ack.Kind != "psubscribe" || ack.Channel != "ch:*" {
+		_ = sub.Close()
+		return nil, fmt.Errorf("unexpected Redis subscription acknowledgement")
+	}
+	logger.Info("Redis message subscription established")
+	return &PubSub{sub: sub, hub: hub}, nil
 }
 
-// ChannelKey returns the Redis pub/sub key for a channel UUID.
 func ChannelKey(channelID uuid.UUID) string {
 	return "ch:" + channelID.String()
 }
 
-// Subscribe tells Redis to start delivering messages for this channel.
-func (ps *PubSub) Subscribe(channelID uuid.UUID) {
-	key := ChannelKey(channelID)
-	if err := ps.sub.Subscribe(context.Background(), key); err != nil {
-		ps.logger.Error("redis subscribe failed", zap.String("channel", key), zap.Error(err))
-	}
-}
-
-// Unsubscribe tells Redis to stop delivering messages for this channel.
-func (ps *PubSub) Unsubscribe(channelID uuid.UUID) {
-	key := ChannelKey(channelID)
-	if err := ps.sub.Unsubscribe(context.Background(), key); err != nil {
-		ps.logger.Error("redis unsubscribe failed", zap.String("channel", key), zap.Error(err))
-	}
-}
-
-// Listen reads messages from Redis and forwards them to the Hub.
 func (ps *PubSub) Listen(ctx context.Context) {
-	ch := ps.sub.Channel()
+	events := ps.sub.ChannelWithSubscriptions()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case msg, ok := <-ch:
+		case event, ok := <-events:
 			if !ok {
 				return
 			}
-			// Channel keys are stored as "ch:<uuid>".
-			if len(msg.Channel) <= 3 {
-				continue
+			switch e := event.(type) {
+			case *goredis.Subscription:
+				if e.Kind == "psubscribe" {
+					ps.hub.Resync()
+				}
+			case *goredis.Message:
+				key, found := strings.CutPrefix(e.Channel, "ch:")
+				id, err := uuid.Parse(key)
+				if found && err == nil {
+					ps.deliver(ctx, id, []byte(e.Payload))
+				}
 			}
-			channelID, err := uuid.Parse(msg.Channel[3:])
-			if err != nil {
-				ps.logger.Warn("invalid channel key from redis", zap.String("key", msg.Channel))
-				continue
-			}
-			ps.hub.Broadcast(channelID, []byte(msg.Payload))
 		}
 	}
 }
 
-// Close releases the Redis pub/sub subscription.
-func (ps *PubSub) Close() {
-	if err := ps.sub.Close(); err != nil {
-		ps.logger.Error("failed to close Redis pubsub", zap.Error(err))
+// Trace propagation is internal to the relay and gateway. Only the public
+// event fields are forwarded to the browser.
+func (ps *PubSub) deliver(ctx context.Context, channel uuid.UUID, payload []byte) {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return
 	}
+	var parent string
+	// Plain public frames need no map or body copy. A Unicode escape may
+	// spell a field name, so those inputs go through the normal JSON decoder.
+	if bytes.Contains(trimmed, []byte(`"traceparent"`)) || bytes.Contains(trimmed, []byte(`\u`)) {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(trimmed, &fields) != nil {
+			return
+		}
+		if private, ok := fields["traceparent"]; ok {
+			_ = json.Unmarshal(private, &parent)
+			delete(fields, "traceparent")
+			payload, _ = json.Marshal(fields)
+		}
+	} else if !json.Valid(trimmed) {
+		return
+	}
+	_, span := observ.StartLinked(ctx, parent, "redis.fanout")
+	defer span.End()
+	ps.hub.Broadcast(channel, payload)
 }
+
+func (ps *PubSub) Close() { _ = ps.sub.Close() }

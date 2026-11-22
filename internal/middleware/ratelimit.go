@@ -3,73 +3,54 @@ package middleware
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	goredis "github.com/redis/go-redis/v9"
 )
 
-// RateLimiter returns middleware that limits each user to `limit` requests
-// per `window` using a Redis counter.
-//
-// How it works:
-//
-//  1. Build a key like "rl:<userID>:<currentMinute>"
-//  2. INCR the key in Redis (atomically increments, creates if missing)
-//  3. If this is the first request in the window, set TTL = window duration
-//  4. If count > limit, respond 429 Too Many Requests
-//
-// Why Redis instead of in-memory?
-//   - Works across multiple server instances
-//   - No memory leak from accumulating user counters
-//   - Keys auto-expire via TTL
-//
-// Why sliding window approximation?
-//   - True sliding window needs sorted sets (complex)
-//   - Fixed window with per-minute keys is simple, predictable, and good enough
+var incrementWindow = goredis.NewScript(`
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+return count
+`)
+
 func RateLimiter(rdb *goredis.Client, limit int, window time.Duration) gin.HandlerFunc {
+	return fixedWindow(rdb, limit, window, "user", false, func(c *gin.Context) string {
+		return GetUserID(c).String()
+	})
+}
+
+// Public authentication is CPU intensive. Protect it even when the limiter is unavailable.
+func AuthRateLimiter(rdb *goredis.Client, limit int, window time.Duration) gin.HandlerFunc {
+	return fixedWindow(rdb, limit, window, "auth", true, func(c *gin.Context) string {
+		return c.ClientIP()
+	})
+}
+
+func fixedWindow(rdb *goredis.Client, limit int, window time.Duration, scope string, failClosed bool, identity func(*gin.Context) string) gin.HandlerFunc {
+	seconds := int64(window / time.Second)
 	return func(c *gin.Context) {
-		userID := GetUserID(c)
-		if userID.String() == "00000000-0000-0000-0000-000000000000" {
-			// No user in context (public route) → skip rate limiting
-			c.Next()
-			return
-		}
-
-		// Key format: "rl:<userID>:<window_bucket>"
-		// The bucket number changes each window, so old keys expire naturally.
-		bucket := time.Now().Unix() / int64(window.Seconds())
-		key := fmt.Sprintf("rl:%s:%d", userID.String(), bucket)
-
-		ctx := c.Request.Context()
-
-		// INCR is atomic: creates key with value 1 if it doesn't exist,
-		// or increments the existing value. Either way, returns the new count.
-		count, err := rdb.Incr(ctx, key).Result()
+		now := time.Now().Unix()
+		key := fmt.Sprintf("rl:%s:%s:%d", scope, identity(c), now/seconds)
+		retryAfter := seconds - now%seconds
+		count, err := incrementWindow.Run(c.Request.Context(), rdb, []string{key}, seconds).Int64()
 		if err != nil {
-			// Redis down → fail open (allow the request through).
-			// Availability > strictness for rate limiting.
+			if failClosed {
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "authentication temporarily unavailable"})
+				return
+			}
 			c.Next()
 			return
 		}
-
-		// First request in this window → set TTL so the key auto-cleans.
-		if count == 1 {
-			rdb.Expire(ctx, key, window)
-		}
-
-		// Set rate limit headers so clients know their budget
-		c.Header("X-RateLimit-Limit", fmt.Sprintf("%d", limit))
-		c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", max(0, int64(limit)-count)))
-
+		c.Header("X-RateLimit-Limit", strconv.Itoa(limit))
+		c.Header("X-RateLimit-Remaining", strconv.FormatInt(max(0, int64(limit)-count), 10))
 		if count > int64(limit) {
-			c.Header("Retry-After", fmt.Sprintf("%d", int64(window.Seconds())))
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
-				"error": "rate limit exceeded",
-			})
+			c.Header("Retry-After", strconv.FormatInt(retryAfter, 10))
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "rate limit exceeded"})
 			return
 		}
-
 		c.Next()
 	}
 }

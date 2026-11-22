@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/lalith-99/echostream/internal/middleware"
+	"github.com/lalith-99/echostream/internal/repository"
 	"github.com/lalith-99/echostream/internal/service"
 	"go.uber.org/zap"
 )
@@ -44,12 +45,23 @@ func (h *MessageHandler) Create(c *gin.Context) {
 	userID := middleware.GetUserID(c)
 	tenantID := middleware.GetTenantID(c)
 
-	msg, err := h.svc.Send(c.Request.Context(), tenantID, channelID, userID, req.Content)
+	var key *uuid.UUID
+	if headers := c.Request.Header.Values("Idempotency-Key"); len(headers) > 0 {
+		value, err := uuid.Parse(headers[0])
+		if err != nil || len(headers) != 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Idempotency-Key must be a UUID"})
+			return
+		}
+		key = &value
+	}
+	msg, created, err := h.svc.Send(c.Request.Context(), tenantID, channelID, userID, req.Content, key)
 	if err != nil {
 		switch {
-		case errors.Is(err, service.ErrEmptyBody), errors.Is(err, service.ErrBodyTooLong):
+		case errors.Is(err, service.ErrEmptyBody), errors.Is(err, service.ErrBodyTooLong), errors.Is(err, service.ErrInvalidBody):
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		case errors.Is(err, service.ErrNotMember):
+		case errors.Is(err, repository.ErrMessageKeyConflict):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		case errors.Is(err, repository.ErrMessageForbidden):
 			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		default:
 			h.logger.Error("failed to send message", zap.Error(err))
@@ -58,10 +70,14 @@ func (h *MessageHandler) Create(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, msg)
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	c.JSON(status, msg)
 }
 
-// List handles GET /v1/channels/:id/messages?before=123&limit=50
+// List returns newest-first history or ascending catch-up after an exclusive cursor.
 func (h *MessageHandler) List(c *gin.Context) {
 	channelID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -69,17 +85,27 @@ func (h *MessageHandler) List(c *gin.Context) {
 		return
 	}
 
-	var before int64
-	if b := c.Query("before"); b != "" {
-		before, err = strconv.ParseInt(b, 10, 64)
-		if err != nil {
+	page := repository.MessagePage{}
+	params := c.Request.URL.Query()
+	hasBefore, hasAfter := params.Has("before"), params.Has("after")
+	if hasBefore && hasAfter {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "use either before or after"})
+		return
+	}
+	if hasBefore {
+		page.Before, err = strconv.ParseInt(params.Get("before"), 10, 64)
+		if err != nil || page.Before < 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid 'before' parameter"})
 			return
 		}
 	}
-	if before < 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid 'before' parameter"})
-		return
+	if hasAfter {
+		id, err := strconv.ParseInt(params.Get("after"), 10, 64)
+		if err != nil || id < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid 'after' parameter"})
+			return
+		}
+		page.After = &id
 	}
 
 	limit := 50
@@ -92,7 +118,12 @@ func (h *MessageHandler) List(c *gin.Context) {
 	}
 
 	tenantID := middleware.GetTenantID(c)
-	messages, err := h.svc.List(c.Request.Context(), tenantID, channelID, before, limit)
+	page.Limit = limit
+	messages, err := h.svc.List(c.Request.Context(), tenantID, channelID, middleware.GetUserID(c), page)
+	if errors.Is(err, repository.ErrMessageForbidden) {
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+		return
+	}
 	if err != nil {
 		h.logger.Error("failed to list messages", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list messages"})

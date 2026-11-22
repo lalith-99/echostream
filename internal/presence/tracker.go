@@ -10,122 +10,100 @@ import (
 )
 
 const (
-	presenceKeyPrefix = "presence:"
-
-	// How long a presence key lives before it's considered stale.
-	// Must be longer than the refresh interval.
-	keyTTL = 90 * time.Second
-
-	// How often we refresh the TTL while the user is connected.
+	keyTTL          = 90 * time.Second
 	refreshInterval = 30 * time.Second
+	storeTimeout    = 2 * time.Second
 )
 
-// Status represents a user's online state.
 type Status string
 
 const (
-	statusOnline  = "online"
-	statusOffline = "offline"
+	Online  Status = "online"
+	Offline Status = "offline"
 )
 
-const (
-	Online  Status = statusOnline
-	Offline Status = statusOffline
-)
+// Each socket owns a separate expiring lease. Redis supplies the clock for
+// both reads and writes so processes do not need synchronized clocks.
+var renewLease = goredis.NewScript(`
+local now = tonumber(redis.call('TIME')[1])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
+redis.call('ZADD', KEYS[1], now + tonumber(ARGV[2]), ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return 1
+`)
 
-// Tracker manages user presence state in Redis.
-//
-// Each online user has a Redis key: "presence:<userID>" = "online"
-// with a TTL. If the server crashes without cleanup, the key
-// expires naturally — no stale "ghost online" users.
+var readLeases = goredis.NewScript(`
+local now = tonumber(redis.call('TIME')[1])
+local result = {}
+for i, key in ipairs(KEYS) do
+    result[i] = redis.call('ZCOUNT', key, '(' .. now, '+inf')
+end
+return result
+`)
+
 type Tracker struct {
 	rdb    *goredis.Client
 	logger *zap.Logger
 }
 
-// NewTracker creates a presence tracker backed by Redis.
 func NewTracker(rdb *goredis.Client, logger *zap.Logger) *Tracker {
 	return &Tracker{rdb: rdb, logger: logger}
 }
 
 func presenceKey(userID uuid.UUID) string {
-	return presenceKeyPrefix + userID.String()
+	return "presence:leases:" + userID.String()
 }
 
-// SetOnline marks a user as online with a TTL.
-// Call this when a WebSocket client registers.
-func (t *Tracker) SetOnline(ctx context.Context, userID uuid.UUID) {
-	key := presenceKey(userID)
-	if err := t.rdb.Set(ctx, key, string(Online), keyTTL).Err(); err != nil {
-		t.logger.Error("presence set failed", zap.Error(err))
+func (t *Tracker) renew(ctx context.Context, userID, leaseID uuid.UUID) error {
+	return renewLease.Run(ctx, t.rdb, []string{presenceKey(userID)}, leaseID.String(), int(keyTTL/time.Second)).Err()
+}
+
+// Track refreshes only this socket's lease. A normal close removes it
+// immediately; after a crash the score and key expiry bound stale presence.
+func (t *Tracker) Track(ctx context.Context, userID uuid.UUID) {
+	leaseID := uuid.New()
+	ticker := time.NewTicker(refreshInterval)
+	defer ticker.Stop()
+
+	for ctx.Err() == nil {
+		writeCtx, cancel := context.WithTimeout(ctx, storeTimeout)
+		err := t.renew(writeCtx, userID, leaseID)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			t.logger.Warn("presence lease refresh failed", zap.Error(err))
+		}
+		select {
+		case <-ctx.Done():
+		case <-ticker.C:
+		}
+	}
+
+	cleanup, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+	if err := t.rdb.ZRem(cleanup, presenceKey(userID), leaseID.String()).Err(); err != nil {
+		t.logger.Warn("presence lease cleanup failed", zap.Error(err))
 	}
 }
 
-// SetOffline removes the user's presence key.
-// Call this when a WebSocket client disconnects.
-func (t *Tracker) SetOffline(ctx context.Context, userID uuid.UUID) {
-	key := presenceKey(userID)
-	if err := t.rdb.Del(ctx, key).Err(); err != nil {
-		t.logger.Error("presence delete failed", zap.Error(err))
-	}
-}
-
-// IsOnline checks if a single user is currently online.
-func (t *Tracker) IsOnline(ctx context.Context, userID uuid.UUID) bool {
-	val, err := t.rdb.Get(ctx, presenceKey(userID)).Result()
-	if err != nil {
-		return false
-	}
-	return val == string(Online)
-}
-
-// BulkStatus returns the presence status for a list of user IDs.
-// Uses Redis MGET for efficiency — one round trip for N users.
 func (t *Tracker) BulkStatus(ctx context.Context, userIDs []uuid.UUID) map[uuid.UUID]Status {
+	result := make(map[uuid.UUID]Status, len(userIDs))
 	if len(userIDs) == 0 {
-		return nil
+		return result
 	}
-
 	keys := make([]string, len(userIDs))
 	for i, id := range userIDs {
 		keys[i] = presenceKey(id)
 	}
-
-	// MGET returns values in the same order as keys.
-	// Missing keys come back as nil (redis.Nil).
-	vals, err := t.rdb.MGet(ctx, keys...).Result()
+	counts, err := readLeases.Run(ctx, t.rdb, keys).Int64Slice()
 	if err != nil {
-		t.logger.Error("presence bulk get failed", zap.Error(err))
+		t.logger.Warn("presence lookup failed", zap.Error(err))
 		return nil
 	}
-
-	result := make(map[uuid.UUID]Status, len(userIDs))
 	for i, id := range userIDs {
-		if vals[i] != nil {
+		result[id] = Offline
+		if counts[i] > 0 {
 			result[id] = Online
-		} else {
-			result[id] = Offline
 		}
 	}
 	return result
-}
-
-// KeepAlive refreshes the TTL for a connected user in a loop.
-// Run this as a goroutine per connected client. It stops when ctx is cancelled
-// (i.e., when the client disconnects and we cancel their context).
-func (t *Tracker) KeepAlive(ctx context.Context, userID uuid.UUID) {
-	ticker := time.NewTicker(refreshInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			key := presenceKey(userID)
-			if err := t.rdb.Expire(ctx, key, keyTTL).Err(); err != nil {
-				t.logger.Debug("presence refresh failed", zap.Error(err))
-			}
-		}
-	}
 }

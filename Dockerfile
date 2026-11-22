@@ -1,15 +1,16 @@
-# Build stage
-FROM golang:1.25-alpine AS builder
-WORKDIR /app
+FROM golang:1.26.11-alpine AS build
+WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/bin/server ./cmd/server
+COPY cmd ./cmd
+COPY internal ./internal
+COPY migrations ./migrations
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ ./cmd/server ./cmd/migrate
 
-# Runtime stage — minimal image
-FROM alpine:3.21
+FROM alpine:3.22
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
-COPY --from=builder /app/bin/server .
-EXPOSE 8080
-CMD ["./server"]
+COPY --from=build /out/ ./
+USER 65532:65532
+EXPOSE 8081
+CMD ["/app/server"]

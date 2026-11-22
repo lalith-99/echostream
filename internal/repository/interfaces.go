@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 
 	"github.com/google/uuid"
 	"github.com/lalith-99/echostream/internal/models"
@@ -10,11 +11,11 @@ import (
 // ChannelRepository defines the contract for channel data operations.
 // All queries are scoped to a tenant for multi-tenancy isolation.
 type ChannelRepository interface {
-	// Create inserts a new channel and returns it with ID and CreatedAt populated.
-	Create(ctx context.Context, tenantID uuid.UUID, name string, isPrivate bool) (*models.Channel, error)
+	// Create inserts the channel and its creator’s admin membership atomically.
+	Create(ctx context.Context, tenantID, creatorID uuid.UUID, name string, isPrivate bool) (*models.Channel, error)
 
-	// GetByID returns a single channel. Returns nil, nil if not found.
-	GetByID(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID) (*models.Channel, error)
+	// GetByID returns a channel visible to the viewer, or nil if it is unavailable.
+	GetByID(ctx context.Context, tenantID, channelID, viewerID uuid.UUID) (*models.Channel, error)
 
 	// ListByTenant returns public channels + private channels where userID is a member.
 	ListByTenant(ctx context.Context, tenantID, userID uuid.UUID, limit, offset int) ([]models.Channel, error)
@@ -22,26 +23,36 @@ type ChannelRepository interface {
 
 // MembershipRepository handles who belongs to which channel.
 type MembershipRepository interface {
-	// AddMember adds a user to a channel with the given role.
-	AddMember(ctx context.Context, channelID uuid.UUID, userID uuid.UUID, role string) error
+	// AddMember authorizes the actor to join or invite a workspace user. The new role is member.
+	AddMember(ctx context.Context, tenantID, channelID, actorID, targetID uuid.UUID) error
 
 	// RemoveMember removes a user from a channel. No-op if not a member.
 	RemoveMember(ctx context.Context, channelID uuid.UUID, userID uuid.UUID) error
 
 	// ListMembers returns members of a channel with pagination.
-	ListMembers(ctx context.Context, channelID uuid.UUID, limit, offset int) ([]models.ChannelMember, error)
+	ListMembers(ctx context.Context, tenantID, channelID, viewerID uuid.UUID, limit, offset int) ([]models.ChannelMember, error)
 
 	// IsMember checks if a user belongs to a channel.
-	IsMember(ctx context.Context, channelID uuid.UUID, userID uuid.UUID) (bool, error)
+	IsMember(ctx context.Context, tenantID, channelID, userID uuid.UUID) (bool, error)
 }
 
-// MessageRepository handles chat message persistence.
-type MessageRepository interface {
-	// Create persists a message and returns it with ID and CreatedAt populated.
-	Create(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID, senderID uuid.UUID, body string) (*models.Message, error)
+var (
+	ErrMessageForbidden   = errors.New("channel membership required")
+	ErrMessageKeyConflict = errors.New("idempotency key already used for different message content")
+)
 
-	// ListByChannel returns messages in a channel, newest first, with cursor pagination.
-	ListByChannel(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID, before int64, limit int) ([]models.Message, error)
+// MessagePage contains exclusive cursors. After selects ascending catch-up order.
+type MessagePage struct {
+	Before int64
+	After  *int64
+	Limit  int
+}
+
+// MessageRepository enforces tenant membership for reads and writes.
+type MessageRepository interface {
+	// Create writes the message and its outbox row atomically. Created is false on a matching retry.
+	Create(ctx context.Context, tenantID, channelID, senderID uuid.UUID, body string, requestKey *uuid.UUID) (message *models.Message, created bool, err error)
+	ListByChannel(ctx context.Context, tenantID, channelID, userID uuid.UUID, page MessagePage) ([]models.Message, error)
 }
 
 // UserRepository handles user data.
@@ -55,8 +66,8 @@ type UserRepository interface {
 	// GetByEmail returns a user by email. Returns nil, nil if not found.
 	GetByEmail(ctx context.Context, email string) (*models.User, error)
 
-	// ListByTenant returns all users in a tenant ordered by display name.
-	ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]models.User, error)
+	// ListByTenant returns a bounded page of directory entries for a current workspace user.
+	ListByTenant(ctx context.Context, tenantID, viewerID uuid.UUID, limit, offset int) ([]models.User, error)
 }
 
 // TenantRepository handles tenant (workspace) data.

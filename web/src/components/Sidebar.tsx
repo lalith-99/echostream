@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import { Hash, Lock, LogOut, MessageSquare, Plus } from 'lucide-react';
+import { useMutation, useInfiniteQuery } from '@tanstack/react-query';
+import { Hash, Lock, LogOut, MessageSquare, Plus, UserPlus } from 'lucide-react';
 import { echostream } from '../lib/api';
 import type { Channel } from '../lib/types';
 import { CreateChannelModal } from './CreateChannelModal';
@@ -25,10 +25,15 @@ export function Sidebar({
 }: Props) {
   const [showCreate, setShowCreate] = useState(false);
 
-  const channelsQuery = useQuery({
+  const invite = useMutation({ mutationFn: echostream.generateInvite });
+
+  const channelsQuery = useInfiniteQuery({
     queryKey: ['channels'],
-    queryFn: () => echostream.listChannels(),
+    initialPageParam: 0,
+    queryFn: ({ pageParam, signal }) => echostream.listChannels(50, pageParam, signal),
+    getNextPageParam: (last, _pages, offset) => last.length === 50 ? offset + 50 : undefined,
   });
+  const channels = new Map(channelsQuery.data?.pages.flat().map((channel) => [channel.id, channel]));
 
   function handleCreated(channel: Channel) {
     setShowCreate(false);
@@ -37,7 +42,7 @@ export function Sidebar({
 
   return (
     <>
-      <aside className="flex w-64 flex-shrink-0 flex-col border-r border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+      <aside className="flex w-32 flex-shrink-0 sm:w-64 flex-col border-r border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
         {/* Workspace header */}
         <div className="flex items-center gap-2 border-b border-slate-200 px-4 py-4 dark:border-slate-800">
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600 text-white">
@@ -49,6 +54,18 @@ export function Sidebar({
           >
             Workspace {workspaceId.slice(0, 8)}
           </span>
+        </div>
+
+        <div className="border-b border-slate-200 px-3 py-2 dark:border-slate-800">
+          <button onClick={() => invite.data ? invite.reset() : invite.mutate()}
+            disabled={invite.isPending} className="flex items-center gap-2 text-xs text-indigo-600 dark:text-indigo-300">
+            <UserPlus className="h-4 w-4" />{invite.data ? 'Hide invite link' : 'Invite to workspace'}
+          </button>
+          {invite.data && <label className="mt-2 block text-xs text-slate-500">Share invite link
+            <input readOnly value={invite.data.invite_url} onFocus={(e) => e.target.select()}
+              className="mt-1 w-full rounded border px-1 py-1 text-slate-800 dark:bg-slate-900 dark:text-white" />
+          </label>}
+          {invite.error && <p role="alert" className="mt-2 text-xs text-red-500">{invite.error.message}</p>}
         </div>
 
         {/* Channel list */}
@@ -72,7 +89,7 @@ export function Sidebar({
           {channelsQuery.isError && (
             <p className="px-2 text-sm text-red-500">Failed to load</p>
           )}
-          {channelsQuery.data?.length === 0 && (
+          {channelsQuery.isSuccess && channels.size === 0 && (
             <p className="px-2 text-sm text-slate-400">
               No channels yet —{' '}
               <button
@@ -85,7 +102,7 @@ export function Sidebar({
           )}
 
           <ul className="mt-1 space-y-0.5">
-            {channelsQuery.data?.map((ch) => (
+            {Array.from(channels.values()).map((ch) => (
               <li key={ch.id}>
                 <button
                   onClick={() => onSelectChannel(ch)}
@@ -106,6 +123,9 @@ export function Sidebar({
               </li>
             ))}
           </ul>
+          {channelsQuery.hasNextPage && <button
+            onClick={() => void channelsQuery.fetchNextPage()} disabled={channelsQuery.isFetchingNextPage}
+            className="px-2 py-2 text-xs text-indigo-600 dark:text-indigo-300">More channels</button>}
         </div>
 
         {/* User footer */}

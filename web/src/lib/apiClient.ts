@@ -18,17 +18,16 @@ interface RequestOptions {
   // Skip attaching the Authorization header (used for signup/login).
   auth?: boolean;
   signal?: AbortSignal;
+  headers?: Record<string, string>;
 }
 
 async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   const { method = 'GET', body, auth = true, signal } = opts;
 
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...opts.headers };
+  const token = auth ? getToken() : null;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
-  if (auth) {
-    const token = getToken();
-    if (token) headers['Authorization'] = `Bearer ${token}`;
-  }
+  if (token) headers['Authorization'] = `Bearer ${token}`;
 
   let res: Response;
   try {
@@ -43,7 +42,7 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   }
 
   // A 401 means the session is invalid/expired — clear it so routing redirects.
-  if (res.status === 401) {
+  if (res.status === 401 && token && getToken() === token) {
     useAuthStore.getState().logout();
     throw new ApiError(401, 'Your session has expired. Please log in again.');
   }
@@ -53,7 +52,12 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   }
 
   const text = await res.text();
-  const data = text ? JSON.parse(text) : undefined;
+  let data;
+  try {
+    data = text ? JSON.parse(text) : undefined;
+  } catch {
+    throw new ApiError(res.status, `Unexpected server response (${res.status})`);
+  }
 
   if (!res.ok) {
     const message =

@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -9,322 +10,126 @@ import (
 	"go.uber.org/zap"
 )
 
-// fakeClient creates a Client with a send channel but nil conn.
-// Good enough for Hub tests — we never call ReadPump/WritePump.
-func fakeClient(hub *Hub, userID uuid.UUID) *Client {
-	return &Client{
-		hub:      hub,
-		conn:     nil,
-		send:     make(chan []byte, sendBufSize),
-		userID:   userID,
-		tenantID: uuid.New(),
-		logger:   zap.NewNop(),
-	}
-}
-
-// drainOne reads exactly one message from c.send with a timeout.
-func drainOne(t *testing.T, c *Client) OutboundEvent {
-	t.Helper()
-	select {
-	case data := <-c.send:
-		var ev OutboundEvent
-		if err := json.Unmarshal(data, &ev); err != nil {
-			t.Fatalf("unmarshal: %v", err)
-		}
-		return ev
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for message")
-		return OutboundEvent{}
-	}
-}
-
 func startHub(t *testing.T) *Hub {
 	t.Helper()
-	hub := NewHub(zap.NewNop())
-	go hub.Run()
-	return hub
+	h := NewHub(zap.NewNop())
+	go h.Run()
+	t.Cleanup(h.Shutdown)
+	return h
 }
 
-func TestRegisterAndUnregister(t *testing.T) {
-	hub := startHub(t)
-	c := fakeClient(hub, uuid.New())
-
-	hub.register <- c
-	time.Sleep(50 * time.Millisecond)
-
-	hub.unregister <- c
-	time.Sleep(50 * time.Millisecond)
-
-	// send channel should be closed after unregister
-	_, open := <-c.send
-	if open {
-		t.Fatal("expected send channel to be closed")
+func testClient(t *testing.T, h *Hub) *Client {
+	t.Helper()
+	c := NewClient(h, nil, uuid.New(), time.Now().Add(time.Hour), func(context.Context, uuid.UUID, uuid.UUID) (bool, error) { return true, nil }, zap.NewNop())
+	if !h.Register(c) {
+		t.Fatal("registration refused")
 	}
+	return c
 }
 
-func TestSubscribeAndBroadcast(t *testing.T) {
-	hub := startHub(t)
-	c := fakeClient(hub, uuid.New())
-	chID := uuid.New()
-
-	hub.register <- c
-	time.Sleep(50 * time.Millisecond)
-
-	hub.subscribeCh <- &subscription{client: c, channelID: chID}
-	time.Sleep(50 * time.Millisecond)
-
-	// Should receive "subscribed" ack
-	ev := drainOne(t, c)
-	if ev.Type != "subscribed" {
-		t.Fatalf("expected subscribed, got %s", ev.Type)
-	}
-
-	// Broadcast a message
-	payload, _ := json.Marshal(OutboundEvent{Type: "message", ChannelID: chID.String()})
-	hub.Broadcast(chID, payload)
-	time.Sleep(50 * time.Millisecond)
-
-	ev = drainOne(t, c)
-	if ev.Type != "message" {
-		t.Fatalf("expected message, got %s", ev.Type)
-	}
-}
-
-func TestBroadcastToEmptyChannel(t *testing.T) {
-	hub := startHub(t)
-
-	// Broadcasting to a channel with no subscribers should not panic.
-	payload, _ := json.Marshal(OutboundEvent{Type: "message"})
-	hub.Broadcast(uuid.New(), payload)
-	time.Sleep(50 * time.Millisecond)
-}
-
-func TestUnsubscribe(t *testing.T) {
-	hub := startHub(t)
-	c := fakeClient(hub, uuid.New())
-	chID := uuid.New()
-
-	hub.register <- c
-	time.Sleep(50 * time.Millisecond)
-	hub.subscribeCh <- &subscription{client: c, channelID: chID}
-	time.Sleep(50 * time.Millisecond)
-	_ = drainOne(t, c) // consume "subscribed" ack
-
-	hub.unsubscribeCh <- &subscription{client: c, channelID: chID}
-	time.Sleep(50 * time.Millisecond)
-	ev := drainOne(t, c) // consume "unsubscribed" ack
-	if ev.Type != "unsubscribed" {
-		t.Fatalf("expected unsubscribed, got %s", ev.Type)
-	}
-
-	// After unsubscribe, broadcast should NOT reach this client
-	payload, _ := json.Marshal(OutboundEvent{Type: "message"})
-	hub.Broadcast(chID, payload)
-	time.Sleep(50 * time.Millisecond)
-
+func next(t *testing.T, c *Client, kind string) frame {
+	t.Helper()
 	select {
-	case <-c.send:
-		t.Fatal("should not receive message after unsubscribe")
-	default:
-		// good — nothing in send buffer
-	}
-}
-
-func TestChannelCallbacks(t *testing.T) {
-	hub := startHub(t)
-
-	var activatedCh, deactivatedCh uuid.UUID
-	hub.SetChannelCallbacks(
-		func(id uuid.UUID) { activatedCh = id },
-		func(id uuid.UUID) { deactivatedCh = id },
-	)
-
-	c := fakeClient(hub, uuid.New())
-	chID := uuid.New()
-
-	hub.register <- c
-	time.Sleep(50 * time.Millisecond)
-
-	// First subscriber triggers onChannelActive
-	hub.subscribeCh <- &subscription{client: c, channelID: chID}
-	time.Sleep(50 * time.Millisecond)
-	_ = drainOne(t, c) // ack
-
-	if activatedCh != chID {
-		t.Fatalf("onChannelActive not called, got %s", activatedCh)
-	}
-
-	// Unregister last subscriber triggers onChannelInactive
-	hub.unregister <- c
-	time.Sleep(50 * time.Millisecond)
-
-	if deactivatedCh != chID {
-		t.Fatalf("onChannelInactive not called, got %s", deactivatedCh)
-	}
-}
-
-func TestTypingExcludesSender(t *testing.T) {
-	hub := startHub(t)
-	sender := fakeClient(hub, uuid.New())
-	receiver := fakeClient(hub, uuid.New())
-	chID := uuid.New()
-
-	hub.register <- sender
-	hub.register <- receiver
-	time.Sleep(50 * time.Millisecond)
-
-	hub.subscribeCh <- &subscription{client: sender, channelID: chID}
-	hub.subscribeCh <- &subscription{client: receiver, channelID: chID}
-	time.Sleep(50 * time.Millisecond)
-	_ = drainOne(t, sender)   // subscribed ack
-	_ = drainOne(t, receiver) // subscribed ack
-	// When receiver subscribes, broadcastPresence fires and sends a presence_change
-	// to sender. Drain it so the typing check below starts with a clean slate.
-	_ = drainOne(t, sender) // presence_change: receiver came online
-
-	// Send typing event
-	hub.typingCh <- &typingEvent{channelID: chID, userID: sender.userID}
-	time.Sleep(50 * time.Millisecond)
-
-	// Receiver should get typing notification
-	ev := drainOne(t, receiver)
-	if ev.Type != "typing" {
-		t.Fatalf("expected typing, got %s", ev.Type)
-	}
-
-	// Sender should NOT get their own typing event
-	select {
-	case <-sender.send:
-		t.Fatal("sender should not receive own typing event")
-	default:
-	}
-}
-
-func TestDisconnectCleansUpAllChannels(t *testing.T) {
-	hub := startHub(t)
-
-	var inactiveCalls int
-	hub.SetChannelCallbacks(
-		func(uuid.UUID) {},
-		func(uuid.UUID) { inactiveCalls++ },
-	)
-
-	c := fakeClient(hub, uuid.New())
-	ch1, ch2 := uuid.New(), uuid.New()
-
-	hub.register <- c
-	time.Sleep(50 * time.Millisecond)
-	hub.subscribeCh <- &subscription{client: c, channelID: ch1}
-	hub.subscribeCh <- &subscription{client: c, channelID: ch2}
-	time.Sleep(50 * time.Millisecond)
-	_ = drainOne(t, c) // ack ch1
-	_ = drainOne(t, c) // ack ch2
-
-	// Disconnect should clean up both channels
-	hub.unregister <- c
-	time.Sleep(50 * time.Millisecond)
-
-	if inactiveCalls != 2 {
-		t.Fatalf("expected 2 onChannelInactive calls, got %d", inactiveCalls)
-	}
-}
-
-func TestClient_Send_NonBlocking(t *testing.T) {
-	hub := NewHub(zap.NewNop())
-	c := fakeClient(hub, uuid.New())
-
-	// Fill the send buffer
-	for i := 0; i < sendBufSize; i++ {
-		c.Send([]byte("x"))
-	}
-
-	// One more Send should NOT block (dropped via select/default)
-	done := make(chan struct{})
-	go func() {
-		c.Send([]byte("overflow"))
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// good — did not block
+	case f := <-c.send:
+		var event OutboundEvent
+		if err := json.Unmarshal(f.data, &event); err != nil || event.Type != kind {
+			t.Fatalf("expected %s, got %s, err=%v", kind, f.data, err)
+		}
+		return f
 	case <-time.After(time.Second):
-		t.Fatal("Send blocked on full buffer")
+		t.Fatalf("timeout waiting for %s", kind)
+		return frame{}
 	}
 }
 
-func TestPresenceBroadcastOnSubscribe(t *testing.T) {
-	hub := startHub(t)
-	chID := uuid.New()
+func subscribe(t *testing.T, c *Client, id uuid.UUID) {
+	t.Helper()
+	c.handleMessage(InboundMessage{Type: "subscribe", ChannelID: id.String()})
+	next(t, c, "subscribed")
+}
 
-	// Register two users and subscribe the first to the channel.
-	alice := fakeClient(hub, uuid.New())
-	bob := fakeClient(hub, uuid.New())
-
-	hub.register <- alice
-	hub.register <- bob
-	time.Sleep(50 * time.Millisecond)
-
-	hub.subscribeCh <- &subscription{client: alice, channelID: chID}
-	time.Sleep(50 * time.Millisecond)
-	_ = drainOne(t, alice) // "subscribed" ack
-
-	// Now Bob subscribes — Alice should get a presence_change (online) for Bob.
-	hub.subscribeCh <- &subscription{client: bob, channelID: chID}
-	time.Sleep(50 * time.Millisecond)
-	_ = drainOne(t, bob) // "subscribed" ack
-
-	ev := drainOne(t, alice)
-	if ev.Type != "presence_change" {
-		t.Fatalf("expected presence_change, got %s", ev.Type)
+func TestHubRoutesOnlySubscribedPeersAndSignalsReconnect(t *testing.T) {
+	h := startHub(t)
+	a, b, other := testClient(t, h), testClient(t, h), testClient(t, h)
+	id := uuid.New()
+	subscribe(t, a, id)
+	subscribe(t, b, id)
+	next(t, a, "presence_refresh")
+	if h.ConnectionCount() != 3 {
+		t.Fatalf("active connections = %d", h.ConnectionCount())
 	}
-	if ev.UserID != bob.userID.String() {
-		t.Fatalf("expected user_id=%s, got %s", bob.userID, ev.UserID)
+	other.handleMessage(InboundMessage{Type: "typing", ChannelID: id.String()})
+	a.handleMessage(InboundMessage{Type: "typing", ChannelID: id.String()})
+	f := next(t, b, "typing")
+	if f.channel != id {
+		t.Fatal("typing event missing delivery membership check")
 	}
-	if ev.Status != "online" {
-		t.Fatalf("expected status=online, got %s", ev.Status)
+	var ev OutboundEvent
+	if err := json.Unmarshal(f.data, &ev); err != nil || ev.UserID != a.userID.String() {
+		t.Fatalf("typing event from wrong sender: %s", f.data)
 	}
 
-	// Bob should NOT receive his own presence event.
-	select {
-	case data := <-bob.send:
-		t.Fatalf("bob should not get his own presence event, got %s", string(data))
-	default:
+	h.Broadcast(id, []byte(`{"type":"message"}`))
+	for _, c := range []*Client{a, b} {
+		if f := next(t, c, "message"); f.channel != id {
+			t.Fatal("message missing delivery membership check")
+		}
+	}
+	h.Resync()
+	for _, c := range []*Client{a, b} {
+		next(t, c, "resync")
+	}
+	if len(other.send) != 0 {
+		t.Fatal("unexpected delivery to unsubscribed client")
+	}
+	b.handleMessage(InboundMessage{Type: "unsubscribe", ChannelID: id.String()})
+	next(t, b, "unsubscribed")
+	next(t, a, "presence_refresh")
+	h.Broadcast(id, []byte(`{"type":"message"}`))
+	next(t, a, "message")
+	if len(b.send) != 0 {
+		t.Fatal("delivery after unsubscribe")
+	}
+
+	h.Unregister(b)
+	h.Resync()
+	next(t, a, "resync")
+	if h.ConnectionCount() != 2 {
+		t.Fatalf("active connections after unregister = %d", h.ConnectionCount())
 	}
 }
 
-func TestPresenceBroadcastOnDisconnect(t *testing.T) {
-	hub := startHub(t)
-	chID := uuid.New()
-
-	alice := fakeClient(hub, uuid.New())
-	bob := fakeClient(hub, uuid.New())
-
-	hub.register <- alice
-	hub.register <- bob
-	time.Sleep(50 * time.Millisecond)
-
-	hub.subscribeCh <- &subscription{client: alice, channelID: chID}
-	time.Sleep(50 * time.Millisecond)
-	_ = drainOne(t, alice) // "subscribed" ack
-
-	hub.subscribeCh <- &subscription{client: bob, channelID: chID}
-	time.Sleep(50 * time.Millisecond)
-	_ = drainOne(t, bob)   // "subscribed" ack
-	_ = drainOne(t, alice) // presence_change online for bob
-
-	// Bob disconnects — Alice should get presence_change (offline).
-	hub.unregister <- bob
-	time.Sleep(100 * time.Millisecond)
-
-	ev := drainOne(t, alice)
-	if ev.Type != "presence_change" {
-		t.Fatalf("expected presence_change, got %s", ev.Type)
+func TestHubSubscriptionLimit(t *testing.T) {
+	h := startHub(t)
+	c := testClient(t, h)
+	for i := 0; i < maxSubscriptions; i++ {
+		subscribe(t, c, uuid.New())
 	}
-	if ev.Status != "offline" {
-		t.Fatalf("expected status=offline, got %s", ev.Status)
+	c.handleMessage(InboundMessage{Type: "subscribe", ChannelID: uuid.NewString()})
+	next(t, c, "error")
+}
+
+func TestFullQueueClosesSessionForRecovery(t *testing.T) {
+	h := startHub(t)
+	c := testClient(t, h)
+	for i := 0; i <= sendBufSize; i++ {
+		c.enqueue(frame{data: []byte("x")})
 	}
-	if ev.UserID != bob.userID.String() {
-		t.Fatalf("expected user_id=%s, got %s", bob.userID, ev.UserID)
+	if c.ctx.Err() == nil {
+		t.Fatal("full queue did not close client")
 	}
+}
+
+func TestShutdownClosesClientsAndUnblocksCallers(t *testing.T) {
+	h := startHub(t)
+	c := testClient(t, h)
+	h.Shutdown()
+	if c.ctx.Err() == nil || h.ConnectionCount() != 0 {
+		t.Fatal("hub did not drain")
+	}
+	if h.Register(c) {
+		t.Fatal("registration after shutdown")
+	}
+	h.Broadcast(uuid.New(), []byte("closed"))
+	h.Unregister(c)
 }

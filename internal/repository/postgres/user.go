@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lalith-99/echostream/internal/models"
+	"github.com/lalith-99/echostream/internal/repository"
 )
 
 type UserStore struct {
@@ -25,6 +26,7 @@ func (s *UserStore) Create(ctx context.Context, tenantID uuid.UUID, email, displ
 	query := `
 		INSERT INTO users (tenant_id, email, display_name, password_hash, created_at)
 		VALUES ($1, $2, $3, $4, now())
+		ON CONFLICT (email) DO NOTHING
 		RETURNING id, tenant_id, email, display_name, password_hash, created_at`
 
 	var u models.User
@@ -36,6 +38,9 @@ func (s *UserStore) Create(ctx context.Context, tenantID uuid.UUID, email, displ
 		&u.PasswordHash,
 		&u.CreatedAt,
 	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, repository.ErrEmailRegistered
+	}
 	if err != nil {
 		return nil, fmt.Errorf("insert user: %w", err)
 	}
@@ -44,7 +49,7 @@ func (s *UserStore) Create(ctx context.Context, tenantID uuid.UUID, email, displ
 
 func (s *UserStore) GetByID(ctx context.Context, tenantID uuid.UUID, userID uuid.UUID) (*models.User, error) {
 	query := `
-		SELECT id, tenant_id, email, display_name, password_hash, created_at
+		SELECT id, tenant_id, email, COALESCE(display_name, ''), created_at
 		FROM users
 		WHERE id = $1 AND tenant_id = $2`
 
@@ -54,7 +59,6 @@ func (s *UserStore) GetByID(ctx context.Context, tenantID uuid.UUID, userID uuid
 		&u.TenantID,
 		&u.Email,
 		&u.DisplayName,
-		&u.PasswordHash,
 		&u.CreatedAt,
 	)
 	if err != nil {
@@ -69,7 +73,7 @@ func (s *UserStore) GetByID(ctx context.Context, tenantID uuid.UUID, userID uuid
 // GetByEmail looks up a user by email (not tenant-scoped, used for login).
 func (s *UserStore) GetByEmail(ctx context.Context, email string) (*models.User, error) {
 	query := `
-		SELECT id, tenant_id, email, display_name, password_hash, created_at
+		SELECT id, tenant_id, email, COALESCE(display_name, ''), password_hash, created_at
 		FROM users
 		WHERE email = $1`
 
@@ -91,14 +95,15 @@ func (s *UserStore) GetByEmail(ctx context.Context, email string) (*models.User,
 	return &u, nil
 }
 
-func (s *UserStore) ListByTenant(ctx context.Context, tenantID uuid.UUID) ([]models.User, error) {
+func (s *UserStore) ListByTenant(ctx context.Context, tenantID, viewerID uuid.UUID, limit, offset int) ([]models.User, error) {
 	query := `
-		SELECT id, tenant_id, email, display_name, created_at
-		FROM users
-		WHERE tenant_id = $1
-		ORDER BY display_name`
+		SELECT u.id, u.tenant_id, u.email, COALESCE(u.display_name, ''), u.created_at
+		FROM users u
+		JOIN users viewer ON viewer.tenant_id = u.tenant_id
+		WHERE u.tenant_id = $1 AND viewer.id = $2
+		ORDER BY u.display_name, u.id LIMIT $3 OFFSET $4`
 
-	rows, err := s.pool.Query(ctx, query, tenantID)
+	rows, err := s.pool.Query(ctx, query, tenantID, viewerID, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
 	}

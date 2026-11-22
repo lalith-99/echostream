@@ -6,79 +6,123 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  local-dependencies:
-    name: Local Compose and migrations
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Validate default and frontend Compose profiles
-        run: |
-          docker compose config --quiet
-          docker compose --profile full config --quiet
-
-      - name: Start local dependencies and apply migrations
-        run: docker compose up -d --wait postgres redis
-
-      - name: Verify the initialized schema
-        run: |
-          docker compose exec -T postgres psql -U echostream -d echostream -v ON_ERROR_STOP=1 <<'SQL'
-          SELECT id, tenant_id, password_hash FROM users LIMIT 0;
-          SELECT id, tenant_id, channel_id, sender_id, body FROM messages LIMIT 0;
-          SELECT channel_id, user_id, role FROM channel_members LIMIT 0;
-          SQL
-
-      - name: Show dependency logs on failure
-        if: failure()
-        run: docker compose logs --no-color
-
-      - name: Clean up disposable CI data
-        if: always()
-        run: docker compose down --volumes
-
   backend:
-    name: Backend
+    name: Go, PostgreSQL and Redis
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TEST_SERVER_BIN: ${{ github.workspace }}/bin/server
+      TEST_DATABASE_URL: postgres://echostream:localtest@localhost:5432/echostream?sslmode=disable
+      TEST_REDIS_URL: redis://localhost:6379
+      ECHOSTREAM_TEST_REDIS_URL: redis://localhost:6379
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: echostream
+          POSTGRES_PASSWORD: localtest
+          POSTGRES_DB: echostream
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U echostream" --health-interval 3s --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 3s --health-timeout 3s --health-retries 20
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
-
-      - name: Build
-        run: go build ./...
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Test
-        run: go test ./...
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: make build
+      - run: DATABASE_URL="$TEST_DATABASE_URL" bin/migrate
+      - run: go vet ./...
+      - name: Check reachable Go vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
+          govulncheck ./...
+      - run: make test
 
   frontend:
-    name: Frontend
+    name: React
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: web
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
 
-      - name: Install
-        run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Build (typecheck + bundle)
-        run: npm run build
-
+  deployment:
+    name: Compose, upgrade and cross-instance delivery
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Initialize a legacy database (pre-migration-ledger)
+        run: |
+          docker compose config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.tracing.yml config --quiet
+          docker compose up -d --wait postgres redis
+          db=(docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U echostream -d echostream)
+          for sql in migrations/00[123]_*.up.sql; do "${db[@]}" < "$sql"; done
+          "${db[@]}" <<'SQL'
+          WITH t AS (INSERT INTO tenants(name) VALUES ('legacy-data-marker') RETURNING id),
+               u AS (INSERT INTO users(tenant_id,email) SELECT id,'legacy@example.com' FROM t RETURNING id,tenant_id),
+               c AS (INSERT INTO channels(tenant_id,name) SELECT id,'legacy-channel' FROM t RETURNING id,tenant_id)
+          INSERT INTO messages(tenant_id,channel_id,sender_id,body)
+            SELECT c.tenant_id,c.id,u.id,'retained message' FROM c JOIN u USING (tenant_id);
+          SQL
+      - name: Build and start the complete application
+        run: make up
+      - name: Verify upgrade and repeat migration with existing data
+        run: |
+          docker compose run --rm --no-deps migrate
+          db=(docker compose exec -T postgres psql -Atq -v ON_ERROR_STOP=1 -U echostream -d echostream)
+          test "$("${db[@]}" -c 'SELECT count(*) FROM echostream_schema_migrations')" = "$(ls migrations/*.up.sql | wc -l)"
+          test "$("${db[@]}" -c "SELECT count(*) FROM messages m JOIN channels c ON c.id=m.channel_id AND c.tenant_id=m.tenant_id JOIN users u ON u.id=m.sender_id AND u.tenant_id=m.tenant_id WHERE m.body='retained message' AND u.email='legacy@example.com' AND c.name='legacy-channel'")" = 1
+          curl -fsS http://127.0.0.1:5173/ | grep -q 'id="root"'
+          curl -fsS http://127.0.0.1:5173/v1/ready
+      - name: Exercise signup, chat and reconnect in Chrome
+        working-directory: web
+        env:
+          ECHO_BROWSER_URL: http://localhost:5173
+          CHROME_PATH: /usr/bin/google-chrome
+        run: |
+          npm ci
+          npm run test:browser
+      - name: Run a second API instance and test through the frontend proxy
+        run: |
+          docker compose run -d --no-deps --name echostream-ci-peer -p 127.0.0.1:8082:8081 api
+          curl --fail --retry 12 --retry-all-errors --retry-delay 1 http://127.0.0.1:8082/v1/ready
+          node scripts/smoke.mjs http://127.0.0.1:8082 http://127.0.0.1:5173
+          node scripts/recovery.mjs http://127.0.0.1:8082 http://127.0.0.1:5173
+      - name: Show service logs on failure
+        if: failure()
+        run: |
+          docker compose logs --no-color
+          docker logs echostream-ci-peer 2>/dev/null || true
+      - name: Clean up disposable CI services
+        if: always()
+        run: |
+          docker rm -f echostream-ci-peer 2>/dev/null || true
+          docker compose down --volumes

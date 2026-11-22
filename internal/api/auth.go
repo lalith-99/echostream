@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -41,16 +42,16 @@ func NewAuthHandler(
 }
 
 type signupRequest struct {
-	Email       string `json:"email" binding:"required,email"`
+	Email       string `json:"email" binding:"required,email,max=254"`
 	Password    string `json:"password" binding:"required,min=8"`
-	DisplayName string `json:"display_name" binding:"required"`
+	DisplayName string `json:"display_name" binding:"required,max=120"`
 	// TenantName is required when InviteToken is empty (creates a new workspace).
-	TenantName  string `json:"tenant_name"`
+	TenantName  string `json:"tenant_name" binding:"max=120"`
 	InviteToken string `json:"invite_token"`
 }
 
 type loginRequest struct {
-	Email    string `json:"email" binding:"required,email"`
+	Email    string `json:"email" binding:"required,email,max=254"`
 	Password string `json:"password" binding:"required"`
 }
 
@@ -69,14 +70,14 @@ func (h *AuthHandler) Signup(c *gin.Context) {
 		return
 	}
 
-	existing, err := h.userRepo.GetByEmail(c.Request.Context(), req.Email)
-	if err != nil {
-		h.logger.Error("failed to check existing user", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "signup failed"})
+	req.DisplayName = strings.TrimSpace(req.DisplayName)
+	req.TenantName = strings.TrimSpace(req.TenantName)
+	if req.DisplayName == "" || (req.InviteToken == "" && req.TenantName == "") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "display name and workspace name or invite are required"})
 		return
 	}
-	if existing != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "email already registered"})
+	if len(req.Password) > 72 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "password exceeds 72 bytes"})
 		return
 	}
 
@@ -108,21 +109,15 @@ func (h *AuthHandler) Signup(c *gin.Context) {
 		}
 		user, err := h.userRepo.Create(c.Request.Context(), parsedTenantID, req.Email, req.DisplayName, string(hash))
 		if err != nil {
-			h.logger.Error("failed to create user via invite", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "signup failed"})
+			h.signupError(c, err)
 			return
 		}
 		userID, tenantID = user.ID, user.TenantID
 	} else {
 		// Create a brand-new workspace + user atomically.
-		if req.TenantName == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "tenant_name is required when invite_token is not provided"})
-			return
-		}
 		tenant, user, err := h.signupRepo.CreateTenantAndUser(c.Request.Context(), req.TenantName, req.Email, req.DisplayName, string(hash))
 		if err != nil {
-			h.logger.Error("signup transaction failed", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "signup failed"})
+			h.signupError(c, err)
 			return
 		}
 		userID, tenantID = user.ID, tenant.ID
@@ -135,7 +130,17 @@ func (h *AuthHandler) Signup(c *gin.Context) {
 		return
 	}
 
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusCreated, authResponse{Token: token})
+}
+
+func (h *AuthHandler) signupError(c *gin.Context, err error) {
+	if errors.Is(err, repository.ErrEmailRegistered) {
+		c.JSON(http.StatusConflict, gin.H{"error": "email already registered"})
+		return
+	}
+	h.logger.Error("failed to create account", zap.Error(err))
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "signup failed"})
 }
 
 // Login handles POST /v1/auth/login
@@ -173,5 +178,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
+	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, authResponse{Token: token})
 }

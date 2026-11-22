@@ -1,43 +1,73 @@
 package config
 
 import (
+	"fmt"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
+const devSecret = "dev-secret-do-not-use-in-prod"
+const composeSecret = "local-only-echostream-development-secret"
+
 type Config struct {
-	Port string
-
-	LogLevel string
-	Env      string
-
-	DatabaseURL string
-	RedisURL    string
-
-	JWTSecret string
-
-	// CORSAllowedOrigins is the list of browser origins permitted to call the API.
-	CORSAllowedOrigins []string
-
-	// FrontendBaseURL is the base URL of the web app; used to build invite links.
-	FrontendBaseURL string
+	Port, AdminPort, LogLevel, Env   string
+	DatabaseURL, RedisURL, JWTSecret string
+	TrustedProxies                   []string
+	CORSAllowedOrigins               []string
+	FrontendBaseURL                  string
 }
 
-// LoadConfig reads config from environment variables.
 func LoadConfig() (*Config, error) {
-	return &Config{
-		Port:               GetEnv("PORT", "8081"),
+	cfg := &Config{
+		Env: GetEnv("ENV", "development"), Port: GetEnv("PORT", "8081"),
+		AdminPort: os.Getenv("ADMIN_PORT"), LogLevel: GetEnv("LOG_LEVEL", "info"),
 		DatabaseURL:        GetEnv("DATABASE_URL", "postgres://echostream:echostream123@localhost:5432/echostream?sslmode=disable"),
 		RedisURL:           GetEnv("REDIS_URL", "redis://localhost:6379"),
-		Env:                GetEnv("ENV", "development"),
-		LogLevel:           GetEnv("LOG_LEVEL", "info"),
-		JWTSecret:          GetEnv("JWT_SECRET", "dev-secret-do-not-use-in-prod"),
+		JWTSecret:          GetEnv("JWT_SECRET", devSecret),
+		FrontendBaseURL:    strings.TrimRight(GetEnv("FRONTEND_BASE_URL", "http://localhost:5173"), "/"),
+		TrustedProxies:     splitAndTrim(os.Getenv("TRUSTED_PROXY_CIDRS")),
 		CORSAllowedOrigins: splitAndTrim(GetEnv("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000")),
-		FrontendBaseURL:    GetEnv("FRONTEND_BASE_URL", "http://localhost:5173"),
-	}, nil
+	}
+	switch cfg.Env {
+	case "development", "test":
+	case "production":
+		for _, name := range []string{"JWT_SECRET", "DATABASE_URL", "REDIS_URL", "FRONTEND_BASE_URL", "CORS_ALLOWED_ORIGINS"} {
+			if strings.TrimSpace(os.Getenv(name)) == "" {
+				return nil, fmt.Errorf("%s is required in production", name)
+			}
+		}
+		if secret := strings.TrimSpace(cfg.JWTSecret); len(secret) < 32 || secret == devSecret || secret == composeSecret {
+			return nil, fmt.Errorf("JWT_SECRET must be a private signing secret of at least 32 bytes in production")
+		}
+		if len(cfg.CORSAllowedOrigins) == 0 {
+			return nil, fmt.Errorf("CORS_ALLOWED_ORIGINS must contain at least one HTTPS origin")
+		}
+	default:
+		return nil, fmt.Errorf("ENV must be development, test, or production")
+	}
+	for _, origin := range append(append([]string(nil), cfg.CORSAllowedOrigins...), cfg.FrontendBaseURL) {
+		u, err := url.Parse(origin)
+		if err != nil || u.Hostname() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || (u.Scheme != "https" && (cfg.Env == "production" || u.Scheme != "http")) {
+			return nil, fmt.Errorf("configure explicit HTTP origins, using HTTPS in production")
+		}
+	}
+	for _, port := range []string{cfg.Port, cfg.AdminPort} {
+		if port == "" {
+			continue
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("invalid listener port")
+		}
+	}
+	if cfg.Port == cfg.AdminPort {
+		return nil, fmt.Errorf("PORT and ADMIN_PORT must differ")
+	}
+	return cfg, nil
 }
 
-// GetEnv returns an env var or a default value.
 func GetEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -45,11 +75,9 @@ func GetEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// splitAndTrim splits a comma-separated list and drops empty/whitespace entries.
 func splitAndTrim(s string) []string {
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
 		if v := strings.TrimSpace(p); v != "" {
 			out = append(out, v)
 		}

@@ -2,90 +2,138 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lalith-99/echostream/internal/models"
+	"github.com/lalith-99/echostream/internal/observ"
+	"github.com/lalith-99/echostream/internal/repository"
 )
 
 type MessageStore struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	wakeup chan struct{}
 }
 
-// NewMessageStore returns a Postgres-backed message store.
 func NewMessageStore(pool *pgxpool.Pool) *MessageStore {
-	return &MessageStore{pool: pool}
+	return &MessageStore{pool: pool, wakeup: make(chan struct{}, 1)}
 }
 
-func (s *MessageStore) Create(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID, senderID uuid.UUID, body string) (*models.Message, error) {
-	query := `
-		INSERT INTO messages (tenant_id, channel_id, sender_id, body, created_at)
-		VALUES ($1, $2, $3, $4, now())
-		RETURNING id, channel_id, sender_id, body, created_at`
+// Include both tenant checks to handle memberships imported from older releases.
+const messageMembership = `
+	SELECT 1 FROM channels c
+	JOIN channel_members cm ON cm.channel_id = c.id
+	JOIN users u ON u.id = cm.user_id AND u.tenant_id = c.tenant_id
+	WHERE c.tenant_id = $1 AND c.id = $2 AND cm.user_id = $3`
 
-	var msg models.Message
-	err := s.pool.QueryRow(ctx, query, tenantID, channelID, senderID, body).Scan(
-		&msg.ID,
-		&msg.ChannelID,
-		&msg.SenderID,
-		&msg.Body,
-		&msg.CreatedAt,
-	)
+const messageFields = `id, channel_id, sender_id, body, created_at`
+
+func scanMessage(row pgx.Row) (*models.Message, error) {
+	var m models.Message
+	err := row.Scan(&m.ID, &m.ChannelID, &m.SenderID, &m.Body, &m.CreatedAt)
+	return &m, err
+}
+
+func checkMessageMembership(ctx context.Context, tx pgx.Tx, query string, tenantID, channelID, userID uuid.UUID) error {
+	var authorized int
+	err := tx.QueryRow(ctx, query, tenantID, channelID, userID).Scan(&authorized)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return repository.ErrMessageForbidden
+	}
+	return err
+}
+
+func (s *MessageStore) Create(ctx context.Context, tenantID, channelID, senderID uuid.UUID, body string, requestKey *uuid.UUID) (*models.Message, bool, error) {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("insert message: %w", err)
+		return nil, false, err
 	}
-	return &msg, nil
+	defer tx.Rollback(ctx)
+
+	// Serialize sends to the same channel BEFORE allocating the bigserial ID.
+	// A committed high-water mark can then never skip a later commit with a
+	// smaller ID. Other channels can write independently. Locking membership
+	// prevents a concurrent leave between authorization and insertion.
+	err = checkMessageMembership(ctx, tx, messageMembership+" FOR NO KEY UPDATE OF c FOR SHARE OF cm", tenantID, channelID, senderID)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if requestKey != nil {
+		existing, err := scanMessage(tx.QueryRow(ctx, "SELECT "+messageFields+` FROM messages
+			WHERE tenant_id = $1 AND channel_id = $2 AND sender_id = $3 AND request_key = $4`,
+			tenantID, channelID, senderID, requestKey))
+		switch {
+		case err == nil && existing.Body != body:
+			return nil, false, repository.ErrMessageKeyConflict
+		case err == nil:
+			return existing, false, nil
+		case !errors.Is(err, pgx.ErrNoRows):
+			return nil, false, fmt.Errorf("look up message retry: %w", err)
+		}
+	}
+
+	msg, err := scanMessage(tx.QueryRow(ctx, `INSERT INTO messages (tenant_id, channel_id, sender_id, body, request_key)
+		VALUES ($1, $2, $3, $4, $5) RETURNING `+messageFields, tenantID, channelID, senderID, body, requestKey))
+	if err != nil {
+		return nil, false, fmt.Errorf("insert message: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "INSERT INTO message_outbox (message_id, traceparent) VALUES ($1, $2)", msg.ID, observ.Traceparent(ctx)); err != nil {
+		return nil, false, fmt.Errorf("enqueue message: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+	// Coalesce hints; another process may already have claimed this row.
+	select {
+	case s.wakeup <- struct{}{}:
+	default:
+	}
+	return msg, true, nil
 }
 
-func (s *MessageStore) ListByChannel(ctx context.Context, tenantID uuid.UUID, channelID uuid.UUID, before int64, limit int) ([]models.Message, error) {
-	// Cursor-based pagination: before=0 means latest, before=N means older than ID N.
-	// tenant_id in WHERE clause = defense-in-depth: even if someone guesses a
-	// channel UUID, the query won't return rows from another tenant.
-	var query string
-	var args []any
-
-	if before > 0 {
-		query = `
-			SELECT id, channel_id, sender_id, body, created_at
-			FROM messages
-			WHERE tenant_id = $1 AND channel_id = $2 AND id < $3
-			ORDER BY id DESC
-			LIMIT $4`
-		args = []any{tenantID, channelID, before, limit}
-	} else {
-		query = `
-			SELECT id, channel_id, sender_id, body, created_at
-			FROM messages
-			WHERE tenant_id = $1 AND channel_id = $2
-			ORDER BY id DESC
-			LIMIT $3`
-		args = []any{tenantID, channelID, limit}
+func (s *MessageStore) ListByChannel(ctx context.Context, tenantID, channelID, userID uuid.UUID, page repository.MessagePage) ([]models.Message, error) {
+	// Check membership and read history at one consistent point in time.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if err := checkMessageMembership(ctx, tx, messageMembership, tenantID, channelID, userID); err != nil {
+		return nil, err
 	}
 
-	rows, err := s.pool.Query(ctx, query, args...)
+	query := "SELECT " + messageFields + ` FROM messages WHERE tenant_id = $1 AND channel_id = $2`
+	args := []any{tenantID, channelID, page.Limit}
+	switch {
+	case page.After != nil:
+		query += " AND id > $4 ORDER BY id ASC"
+		args = append(args, *page.After)
+	case page.Before > 0:
+		query += " AND id < $4 ORDER BY id DESC"
+		args = append(args, page.Before)
+	default:
+		query += " ORDER BY id DESC"
+	}
+
+	rows, err := tx.Query(ctx, query+" LIMIT $3", args...)
 	if err != nil {
 		return nil, fmt.Errorf("list messages: %w", err)
 	}
 	defer rows.Close()
-
 	messages := make([]models.Message, 0)
 	for rows.Next() {
-		var msg models.Message
-		if err := rows.Scan(
-			&msg.ID,
-			&msg.ChannelID,
-			&msg.SenderID,
-			&msg.Body,
-			&msg.CreatedAt,
-		); err != nil {
-			return nil, fmt.Errorf("scan message: %w", err)
+		msg, err := scanMessage(rows)
+		if err != nil {
+			return nil, err
 		}
-		messages = append(messages, msg)
+		messages = append(messages, *msg)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate messages: %w", err)
+		return nil, err
 	}
-
-	return messages, nil
+	return messages, tx.Commit(ctx)
 }

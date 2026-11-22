@@ -3,6 +3,7 @@ package invite
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -12,8 +13,9 @@ import (
 )
 
 const (
-	keyPrefix = "invite:"
-	TokenTTL  = 7 * 24 * time.Hour
+	keyPrefix       = "invite:"
+	hashedKeyPrefix = "invite-sha256:"
+	TokenTTL        = 7 * 24 * time.Hour
 )
 
 // ErrNotFound is returned when a token does not exist or has expired.
@@ -30,15 +32,14 @@ func NewService(rdb *goredis.Client) *Service {
 	return &Service{rdb: rdb}
 }
 
-// Generate creates a cryptographically random token and stores it in Redis
-// with tenantID as the value. Returns the token string.
+// Generate returns the bearer token and stores its digest with the workspace ID and expiry.
 func (s *Service) Generate(ctx context.Context, tenantID string) (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("generate invite token: %w", err)
 	}
-	token := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(b)
-	if err := s.rdb.Set(ctx, keyPrefix+token, tenantID, TokenTTL).Err(); err != nil {
+	token := base64.RawURLEncoding.EncodeToString(b)
+	if err := s.rdb.Set(ctx, tokenKey(token), tenantID, TokenTTL).Err(); err != nil {
 		return "", fmt.Errorf("store invite token: %w", err)
 	}
 	return token, nil
@@ -47,7 +48,15 @@ func (s *Service) Generate(ctx context.Context, tenantID string) (string, error)
 // Resolve looks up a token and returns its tenant ID.
 // Returns ErrNotFound if the token is missing or expired.
 func (s *Service) Resolve(ctx context.Context, token string) (string, error) {
-	tenantID, err := s.rdb.Get(ctx, keyPrefix+token).Result()
+	b, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil || len(b) != 16 {
+		return "", ErrNotFound
+	}
+	tenantID, err := s.rdb.Get(ctx, tokenKey(token)).Result()
+	if errors.Is(err, goredis.Nil) {
+		// A link minted before hashed keys were introduced stays valid until its original TTL.
+		tenantID, err = s.rdb.Get(ctx, keyPrefix+token).Result()
+	}
 	if err != nil {
 		if errors.Is(err, goredis.Nil) {
 			return "", ErrNotFound
@@ -55,4 +64,9 @@ func (s *Service) Resolve(ctx context.Context, token string) (string, error) {
 		return "", fmt.Errorf("resolve invite token: %w", err)
 	}
 	return tenantID, nil
+}
+
+func tokenKey(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hashedKeyPrefix + base64.RawURLEncoding.EncodeToString(sum[:])
 }

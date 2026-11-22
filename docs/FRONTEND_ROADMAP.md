@@ -1,11 +1,8 @@
 # EchoStream Frontend & Portfolio Roadmap
 
-> Goal: ship a real, production-grade web client for the EchoStream chat backend that
-> (a) teaches me frontend end-to-end, (b) makes the repo obviously impressive to SDE2/SDE3
-> recruiters, and (c) can be run as a **live demo** they can click through.
->
-> This doc is the single source of truth for the frontend effort. We tackle **P0 first**,
-> keep P1/P2 documented, and revisit later. Check items off as we go.
+> Archived planning notes from the initial frontend build. The checkboxes and
+> candidate libraries record that plan. For current features, setup and
+> executable checks, see the [web client documentation](../web/README.md).
 
 ---
 
