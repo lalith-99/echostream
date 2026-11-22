@@ -1,0 +1,260 @@
+{
+  "workflow_run": 45034011449,
+  "job_id": 137243619864,
+  "original": {
+    "membership_sql_calls": 531740,
+    "driver": {
+      "commit": "1ed40e5995678a30e003593e61e993399085fb8a",
+      "run": "45034011449",
+      "node": "v22.23.5",
+      "platform": "linux",
+      "arch": "x64",
+      "cpu": "AMD EPYC 9V45 96-Core Processor",
+      "cpus_available": 4,
+      "total_memory_bytes": 16759427072,
+      "cpu_quota": null,
+      "memory_limit_bytes": null,
+      "gateways": 2,
+      "accounts": 16,
+      "sockets": 256,
+      "payload_bytes": 512,
+      "rounds": 42,
+      "interval_ms": 1500,
+      "disconnects": 0,
+      "socket_errors": 0,
+      "unexpected_frames": 0,
+      "trials": [
+        {
+          "trial": 1,
+          "elapsed_ms": 61741.6,
+          "scheduler_lag_ms": {
+            "samples": 42,
+            "p50": 0.16,
+            "p95": 1.02,
+            "p99": 1.24,
+            "max": 1.24
+          },
+          "attempted": 672,
+          "acknowledged": 672,
+          "unique_ack_ids": 672,
+          "verified_pairs": 172032,
+          "missing": 0,
+          "mismatches": 0,
+          "duplicates": 0,
+          "http_errors": {},
+          "verified_pairs_per_second": 2786.3,
+          "http_ack_ms": {
+            "samples": 672,
+            "p50": 93.77,
+            "p95": 217.44,
+            "p99": 242.5,
+            "max": 281.29
+          },
+          "live_observation_ms": {
+            "samples": 172032,
+            "p50": 126.36,
+            "p95": 233.7,
+            "p99": 256.15,
+            "max": 297.9
+          }
+        },
+        {
+          "trial": 2,
+          "elapsed_ms": 61757.4,
+          "scheduler_lag_ms": {
+            "samples": 42,
+            "p50": 0,
+            "p95": 1.08,
+            "p99": 1.45,
+            "max": 1.45
+          },
+          "attempted": 672,
+          "acknowledged": 672,
+          "unique_ack_ids": 672,
+          "verified_pairs": 172032,
+          "missing": 0,
+          "mismatches": 0,
+          "duplicates": 0,
+          "http_errors": {},
+          "verified_pairs_per_second": 2785.6,
+          "http_ack_ms": {
+            "samples": 672,
+            "p50": 86.49,
+            "p95": 212.47,
+            "p99": 230.98,
+            "max": 249.35
+          },
+          "live_observation_ms": {
+            "samples": 172032,
+            "p50": 126.72,
+            "p95": 236.68,
+            "p99": 254.6,
+            "max": 281.3
+          }
+        },
+        {
+          "trial": 3,
+          "elapsed_ms": 61745.2,
+          "scheduler_lag_ms": {
+            "samples": 42,
+            "p50": 0,
+            "p95": 0.81,
+            "p99": 1.09,
+            "max": 1.09
+          },
+          "attempted": 672,
+          "acknowledged": 672,
+          "unique_ack_ids": 672,
+          "verified_pairs": 172032,
+          "missing": 0,
+          "mismatches": 0,
+          "duplicates": 0,
+          "http_errors": {},
+          "verified_pairs_per_second": 2786.2,
+          "http_ack_ms": {
+            "samples": 672,
+            "p50": 97.32,
+            "p95": 217.7,
+            "p99": 248.57,
+            "max": 290.01
+          },
+          "live_observation_ms": {
+            "samples": 172032,
+            "p50": 130.02,
+            "p95": 243.03,
+            "p99": 265.53,
+            "max": 317.22
+          }
+        }
+      ]
+    }
+  },
+  "batched": {
+    "membership_sql_calls": 34630,
+    "driver": {
+      "commit": "6171b8703ee92914ea17ae96952b18b476dbc327",
+      "run": "45034011449",
+      "node": "v22.23.5",
+      "platform": "linux",
+      "arch": "x64",
+      "cpu": "AMD EPYC 9V45 96-Core Processor",
+      "cpus_available": 4,
+      "total_memory_bytes": 16759427072,
+      "cpu_quota": null,
+      "memory_limit_bytes": null,
+      "gateways": 2,
+      "accounts": 16,
+      "sockets": 256,
+      "payload_bytes": 512,
+      "rounds": 42,
+      "interval_ms": 1500,
+      "disconnects": 0,
+      "socket_errors": 0,
+      "unexpected_frames": 0,
+      "trials": [
+        {
+          "trial": 1,
+          "elapsed_ms": 61586.8,
+          "scheduler_lag_ms": {
+            "samples": 42,
+            "p50": 0,
+            "p95": 0.81,
+            "p99": 1.4,
+            "max": 1.4
+          },
+          "attempted": 672,
+          "acknowledged": 672,
+          "unique_ack_ids": 672,
+          "verified_pairs": 172032,
+          "missing": 0,
+          "mismatches": 0,
+          "duplicates": 0,
+          "http_errors": {},
+          "verified_pairs_per_second": 2793.3,
+          "http_ack_ms": {
+            "samples": 672,
+            "p50": 37.99,
+            "p95": 74.77,
+            "p99": 88.59,
+            "max": 140.48
+          },
+          "live_observation_ms": {
+            "samples": 172032,
+            "p50": 45.03,
+            "p95": 79.32,
+            "p99": 99.63,
+            "max": 148.91
+          }
+        },
+        {
+          "trial": 2,
+          "elapsed_ms": 61573.5,
+          "scheduler_lag_ms": {
+            "samples": 42,
+            "p50": 0,
+            "p95": 0.97,
+            "p99": 1.09,
+            "max": 1.09
+          },
+          "attempted": 672,
+          "acknowledged": 672,
+          "unique_ack_ids": 672,
+          "verified_pairs": 172032,
+          "missing": 0,
+          "mismatches": 0,
+          "duplicates": 0,
+          "http_errors": {},
+          "verified_pairs_per_second": 2793.9,
+          "http_ack_ms": {
+            "samples": 672,
+            "p50": 37.83,
+            "p95": 72.93,
+            "p99": 84.92,
+            "max": 100.09
+          },
+          "live_observation_ms": {
+            "samples": 172032,
+            "p50": 43.26,
+            "p95": 77.46,
+            "p99": 85.8,
+            "max": 104.01
+          }
+        },
+        {
+          "trial": 3,
+          "elapsed_ms": 61597.9,
+          "scheduler_lag_ms": {
+            "samples": 42,
+            "p50": 0,
+            "p95": 1.07,
+            "p99": 1.13,
+            "max": 1.13
+          },
+          "attempted": 672,
+          "acknowledged": 672,
+          "unique_ack_ids": 672,
+          "verified_pairs": 172032,
+          "missing": 0,
+          "mismatches": 0,
+          "duplicates": 0,
+          "http_errors": {},
+          "verified_pairs_per_second": 2792.8,
+          "http_ack_ms": {
+            "samples": 672,
+            "p50": 38.97,
+            "p95": 76.92,
+            "p99": 85.65,
+            "max": 95.01
+          },
+          "live_observation_ms": {
+            "samples": 172032,
+            "p50": 46.5,
+            "p95": 81.08,
+            "p99": 92.37,
+            "max": 107.72
+          }
+        }
+      ]
+    }
+  }
+}
