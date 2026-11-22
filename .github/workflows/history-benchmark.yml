@@ -21,6 +21,8 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Compare validated history pages against the original implementation
+        env:
+          HISTORY_DELAYED_LINK: "1"
         run: bash scripts/history/run.sh | tee history-results.txt
         shell: bash
       - uses: actions/upload-artifact@v4

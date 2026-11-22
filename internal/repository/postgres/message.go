@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lalith-99/echostream/internal/models"
 	"github.com/lalith-99/echostream/internal/observ"
@@ -110,9 +111,9 @@ func (s *MessageStore) ListByChannel(ctx context.Context, tenantID, channelID, u
 		args = append(args, page.Before)
 	}
 
-	query := `SELECT p.id, p.channel_id, p.sender_id, p.body, p.created_at
+	query := `SELECT p.id, p.sender_id, p.body, p.created_at
 		FROM (SELECT c.id ` + messageMembership + `) AS member
-		LEFT JOIN LATERAL (SELECT ` + messageFields + ` FROM messages
+		LEFT JOIN LATERAL (SELECT id, sender_id, body, created_at FROM messages
 			WHERE tenant_id = $1 AND channel_id = member.id` + cursor +
 		" ORDER BY id " + order + " LIMIT $4) AS p ON true ORDER BY p.id " + order
 	rows, err := s.pool.Query(ctx, query, args...)
@@ -120,18 +121,21 @@ func (s *MessageStore) ListByChannel(ctx context.Context, tenantID, channelID, u
 		return nil, fmt.Errorf("list messages: %w", err)
 	}
 	defer rows.Close()
-	messages := make([]models.Message, 0)
+	messages := make([]models.Message, 0, min(max(page.Limit, 0), 100))
 	authorized := false
 	for rows.Next() {
 		authorized = true
 		if rows.RawValues()[0] == nil {
 			continue
 		}
-		msg, err := scanMessage(rows)
-		if err != nil {
+		messages = append(messages, models.Message{ChannelID: channelID})
+		msg := &messages[len(messages)-1]
+		// Decode the binary UUID directly, without formatting and parsing text.
+		var sender pgtype.UUID
+		if err := rows.Scan(&msg.ID, &sender, &msg.Body, &msg.CreatedAt); err != nil {
 			return nil, err
 		}
-		messages = append(messages, *msg)
+		msg.SenderID = uuid.UUID(sender.Bytes)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

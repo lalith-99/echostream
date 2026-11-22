@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -68,7 +70,10 @@ func TestHistoryReadLoad(t *testing.T) {
 		}
 		for j, m := range messages {
 			want := first + int64(j)*step
-			if m.ID != want || m.ChannelID != ids[channel] || m.SenderID != member || m.Body != fmt.Sprintf("message-%d%s", want, padding) {
+			number, hasPrefix := strings.CutPrefix(m.Body, "message-")
+			number, hasSuffix := strings.CutSuffix(number, padding)
+			bodyID, err := strconv.ParseInt(number, 10, 64)
+			if m.ID != want || m.ChannelID != ids[channel] || m.SenderID != member || !hasPrefix || !hasSuffix || err != nil || bodyID != want {
 				return 0, fmt.Errorf("request %d item %d: unexpected ID, channel, sender or body", i, j)
 			}
 		}
@@ -105,11 +110,15 @@ func TestHistoryReadLoad(t *testing.T) {
 		return samples, elapsed
 	}
 	run(1024)
-	samples, duration := run(16384)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	samples, duration := run(65536)
+	runtime.ReadMemStats(&after)
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
 	percentile := func(q float64) float64 {
 		return float64(samples[int(math.Ceil(q*float64(len(samples))))-1]) / float64(time.Millisecond)
 	}
-	t.Logf("history_load samples=%d clients=%d duration_s=%.3f pages_s=%.1f p50_ms=%.3f p95_ms=%.3f p99_ms=%.3f",
-		len(samples), clients, duration.Seconds(), float64(len(samples))/duration.Seconds(), percentile(.5), percentile(.95), percentile(.99))
+	t.Logf("history_load samples=%d clients=%d duration_s=%.3f pages_s=%.1f p50_ms=%.3f p95_ms=%.3f p99_ms=%.3f allocated_bytes_page=%.0f mallocs_page=%.1f",
+		len(samples), clients, duration.Seconds(), float64(len(samples))/duration.Seconds(), percentile(.5), percentile(.95), percentile(.99),
+		float64(after.TotalAlloc-before.TotalAlloc)/float64(len(samples)), float64(after.Mallocs-before.Mallocs)/float64(len(samples)))
 }
